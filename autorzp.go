@@ -510,8 +510,26 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 	if kyid == "" {
 		kyid = getStringFromMap(initData, "key")
 	}
+	// Fallback: some pages nest key_id inside "options" or "options.key"
 	if kyid == "" {
-		return CheckResult{Status: "error", Message: "Razorpay Key ID not found", Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		if opts, ok := initData["options"].(map[string]interface{}); ok {
+			kyid = getStringFromMap(opts, "key")
+			if kyid == "" {
+				kyid = getStringFromMap(opts, "key_id")
+			}
+		}
+	}
+	// Fallback: "merchant_key" field
+	if kyid == "" {
+		kyid = getStringFromMap(initData, "merchant_key")
+	}
+	if kyid == "" {
+		// Show what keys ARE present to help debug
+		keys := make([]string, 0, len(initData))
+		for k := range initData {
+			keys = append(keys, k)
+		}
+		return CheckResult{Status: "error", Message: "Key ID not found. Keys: " + strings.Join(keys, ","), Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
 
 	var plink, ppid string
@@ -682,7 +700,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 		h := stdHeaders()
 		h["Content-Type"] = "application/json"
 		_, _ = fetch.PostJSON(
-			fmt.Sprintf("https://api.razorpay.com/v2/standard_checkout/preferences?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeader),
+			fmt.Sprintf("https://api.razorpay.com/v2/standard_checkout/preferences?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
 			h, r4Payload,
 		)
 	}
@@ -726,7 +744,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 		h := stdHeaders()
 		h["Content-Type"] = "application/x-www-form-urlencoded"
 		_, _ = fetch.PostForm(
-			fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/checkout/order?key_id=%s&session_token=%s&keyless_header=%s", kyid, sessid, keylessHeader),
+			fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/checkout/order?key_id=%s&session_token=%s&keyless_header=%s", kyid, sessid, keylessHeaderURL),
 			h, form5,
 		)
 	}
@@ -806,7 +824,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 	}
 
 	r7, err := fetch.PostForm(
-		fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeader),
+		fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
 		stdHeaders(),
 		form7,
 	)
@@ -816,7 +834,12 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 
 	var r7Data map[string]interface{}
 	if err := json.Unmarshal([]byte(r7.Text()), &r7Data); err != nil {
-		return CheckResult{Status: "error", Message: "Payment create response parse failed", Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		// Truncate actual response body — helps debug HTML error pages vs malformed JSON
+		body := strings.TrimSpace(r7.Text())
+		if len(body) > 120 {
+			body = body[:120] + "..."
+		}
+		return CheckResult{Status: "error", Message: "r7 parse failed: " + body, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
 
 	paymentID := getStringFromMap(r7Data, "payment_id")
