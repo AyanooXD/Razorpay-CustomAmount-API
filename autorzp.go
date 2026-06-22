@@ -253,14 +253,9 @@ func randInt(min, max int) int {
 	return int(n.Int64()) + min
 }
 
-// genUA and genSecChUA were previously separate functions that each picked
-// their OWN random Chrome major — so the User-Agent header said "Chrome 145"
-// while Sec-CH-UA said "Chrome 121". That mismatch is a trivial WAF
-// fingerprint. We now pick ONE Chrome major per CustomFetch and derive both
-// headers from it inside NewCustomFetch. genUA is still used by checkCard to
-// produce a UA passed into NewCustomFetch (which then derives a matching
-// Sec-CH-UA from the SAME Chrome major). genSecChUA is retained for any
-// future caller that needs a standalone Sec-CH-UA string.
+// genUA returns a random Chrome User-Agent string. checkCard uses this to
+// generate a UA, then passes it to NewCustomFetch which derives a MATCHING
+// Sec-CH-UA from the same Chrome major (see parseChromeMajor).
 func genUA() string {
 	major := randInt(120, 147)
 	build := randInt(5000, 6999)
@@ -268,6 +263,9 @@ func genUA() string {
 	return fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.%d.%d Safari/537.36", major, build, patch)
 }
 
+// genSecChUA is retained for any future caller that needs a standalone
+// Sec-CH-UA string. The main flow uses CustomFetch.secChUA instead, which is
+// derived from the same Chrome major as the User-Agent.
 func genSecChUA() string {
 	major := randInt(120, 147)
 	return fmt.Sprintf(`"Not_A Brand";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, major, major)
@@ -666,13 +664,6 @@ func generateAcceptLanguage() string {
 	return langs[randInt(0, len(langs)-1)]
 }
 
-func generateSecFetchSite(referer string) string {
-	if strings.Contains(referer, "razorpay.com") {
-		return "same-site"
-	}
-	return "cross-site"
-}
-
 type FetchResponse struct {
 	Body       string
 	StatusCode int
@@ -681,12 +672,6 @@ type FetchResponse struct {
 
 func (r *FetchResponse) Text() string {
 	return r.Body
-}
-
-func (r *FetchResponse) JSON() (map[string]interface{}, error) {
-	var result map[string]interface{}
-	err := json.Unmarshal([]byte(r.Body), &result)
-	return result, err
 }
 
 type CustomFetch struct {

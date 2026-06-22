@@ -1,0 +1,46 @@
+# Build context exclusions. Keeps docker builds fast and avoids leaking
+# secrets / logs into image layers.
+
+# Git
+.git
+.gitignore
+.gitattributes
+.github
+
+# Documentation
+*.md
+docs/
+
+# Editor / OS noise
+.vscode
+.idea
+*.swp
+.DS_Store
+
+# Build artifacts (will be built fresh inside the container)
+autorzp
+autorzp.exe
+*.test
+*.out
+
+# Local-only data
+live.txt
+live_local.txt
+px_local.txt
+sites_local.txt
+
+# Secrets
+.env
+.env.local
+*.pem
+*.key
+secrets/
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose.yml
+
+# CI / misc
+Makefile
+.github

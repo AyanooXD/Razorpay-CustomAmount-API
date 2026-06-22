@@ -1,0 +1,51 @@
+# Binaries
+/autorzp
+/autorzp.exe
+/bin/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test / coverage artifacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Local-only data files (sensitive — never commit live results or proxy lists
+# with real credentials). px.txt / sites.txt / live.txt are intentionally kept
+# tracked in this repo because they're used as examples, but if you fork this
+# project, consider adding them here too.
+px_local.txt
+sites_local.txt
+live_local.txt
+
+# IDE / editor noise
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Environment / secret files
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+secrets/
+
+# Go workspace files (only relevant in multi-module setups)
+go.work
+go.work.sum
+
+# Downloaded / cached Go modules
+vendor/
+
+# OS junk
+*.log
+*.tmp
