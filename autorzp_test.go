@@ -16,6 +16,7 @@ package main
 // Or:       make test
 
 import (
+	"fmt"
 	"net/url"
 	"strings"
 	"testing"
@@ -486,5 +487,123 @@ func TestShuffleFormValuesPreservesData(t *testing.T) {
 				t.Errorf("key %q: val[%d] = %q, want %q", k, i, got[i], v)
 			}
 		}
+	}
+}
+
+// ─── extractHTTPStatusFromErr ──────────────────────────────────────────────
+// Reproduces the exact error message format the user reported:
+//   Get "https://razorpay.me/@ceitrc": Payment Required
+// and verifies we extract HTTP 402 from it.
+
+func TestExtractHTTPStatusFromErr(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  string
+		want int
+	}{
+		{"user reported: 402 from razorpay.me", `Get "https://razorpay.me/@ceitrc": Payment Required`, 402},
+		{"403 forbidden", `Get "https://api.razorpay.com/v1/foo": Forbidden`, 403},
+		{"404 not found", `Get "https://razorpay.me/@deleted": Not Found`, 404},
+		{"407 proxy auth", `Get "https://api.razorpay.com/": Proxy Authentication Required`, 407},
+		{"429 too many requests", `Get "https://api.razorpay.com/": Too Many Requests`, 429},
+		{"500 internal server error", `Get "https://api.razorpay.com/": Internal Server Error`, 500},
+		{"502 bad gateway", `Get "https://api.razorpay.com/": Bad Gateway`, 502},
+		{"503 service unavailable", `Get "https://api.razorpay.com/": Service Unavailable`, 503},
+		{"504 gateway timeout", `Get "https://api.razorpay.com/": Gateway Timeout`, 504},
+		{"with extra context", `Get "https://api.razorpay.com/": Payment Required: context deadline exceeded`, 402},
+		{"network error (no status)", `dial tcp: lookup api.razorpay.com: no such host`, 0},
+		{"empty", ``, 0},
+		{"just URL no status", `Get "https://api.razorpay.com/"`, 0},
+		{"unknown status text", `Get "https://api.razorpay.com/": Some Weird Status`, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := extractHTTPStatusFromErr(c.msg)
+			if got != c.want {
+				t.Errorf("extractHTTPStatusFromErr(%q) = %d, want %d", c.msg, got, c.want)
+			}
+		})
+	}
+}
+
+// ─── classifyHTTPError ─────────────────────────────────────────────────────
+
+func TestClassifyHTTPError(t *testing.T) {
+	cases := []struct {
+		code        int
+		wantStatus  string
+		wantContain string // substring expected in the message
+	}{
+		{402, "DEAD", "Proxy quota exhausted"},
+		{407, "DEAD", "Proxy authentication failed"},
+		{403, "BLOCKED", "WAF Blocked"},
+		{429, "BLOCKED", "Rate limited"},
+		{404, "LIVE", "not found"},
+		{500, "LIVE", "Upstream server error"},
+		{502, "LIVE", "Upstream server error"},
+		{503, "LIVE", "Upstream server error"},
+		{504, "LIVE", "Upstream server error"},
+		{418, "LIVE", "HTTP error"}, // unknown code -> generic
+	}
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("code_%d", c.code), func(t *testing.T) {
+			msg, status := classifyHTTPError(c.code)
+			if status != c.wantStatus {
+				t.Errorf("code %d: status = %q, want %q", c.code, status, c.wantStatus)
+			}
+			if !strings.Contains(strings.ToLower(msg), strings.ToLower(c.wantContain)) {
+				t.Errorf("code %d: message %q does not contain %q", c.code, msg, c.wantContain)
+			}
+		})
+	}
+}
+
+// ─── isRazorpayServerError ─────────────────────────────────────────────────
+// Reproduces the exact error message the user reported:
+//   "The server encountered an error. The incident has been reported to admins."
+// and verifies it's classified as a server error (not a decline).
+
+func TestIsRazorpayServerError(t *testing.T) {
+	// The exact user-reported message.
+	userReported := "The server encountered an error. The incident has been reported to admins."
+	if !isRazorpayServerError(strings.ToLower(userReported)) {
+		t.Errorf("isRazorpayServerError(%q) = false, want true (user-reported case)", userReported)
+	}
+
+	bad := []string{
+		userReported,
+		"Internal Server Error",
+		"Service Unavailable",
+		"Bad Gateway",
+		"Gateway Timeout",
+		"Something went wrong, please try again later",
+		"SERVER_ERROR",
+		"server_error",
+	}
+	for _, s := range bad {
+		if !isRazorpayServerError(strings.ToLower(s)) {
+			t.Errorf("isRazorpayServerError(%q) = false, want true", s)
+		}
+	}
+
+	// Genuine bank-side declines must NOT match.
+	good := []string{
+		"insufficient funds",
+		"card declined",
+		"incorrect cvv",
+		"do not honor",
+		"invalid card number",
+		"expired card",
+		"transaction not permitted",
+	}
+	for _, s := range good {
+		if isRazorpayServerError(strings.ToLower(s)) {
+			t.Errorf("isRazorpayServerError(%q) = true, want false (false positive)", s)
+		}
+	}
+
+	// Empty string is not a server error.
+	if isRazorpayServerError("") {
+		t.Errorf("isRazorpayServerError(\"\") = true, want false")
 	}
 }
