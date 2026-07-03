@@ -1055,12 +1055,25 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 
 	var plink, ppid string
 
-	// ── Custom amount + currency support ────────────────────────────────
+	// ── Custom amount support ────────────────────────────────────────────
 	// `amountINR` is the amount in MAJOR units (e.g. 1.0 = ₹1, 5.5 = ₹5.50).
 	// Razorpay's API expects the smallest currency unit (paise for INR,
-	// cents for USD/EUR, whole units for JPY/KRW). We convert here ONCE and
-	// reuse `forceAmount` everywhere downstream so the order, checkout form,
-	// cross-border call, and payment-create form all see the same value.
+	// cents for USD/EUR). We convert here ONCE and reuse `forceAmount`
+	// everywhere downstream so the order, checkout form, cross-border call,
+	// and payment-create form all see the same value.
+	//
+	// IMPORTANT: At this point we don't yet know the order's actual currency
+	// (it comes from the order response later). Razorpay payment links are
+	// currency-locked — the order inherits the link's currency regardless
+	// of what the user requested. So we ALWAYS multiply by 100 (treat as
+	// 2-decimal/INR). This is correct for INR, USD, EUR, GBP, etc.
+	// (which covers 99%+ of Razorpay sites). For 0-decimal currencies
+	// (JPY/KRW) the amount would be 100x too large, but those are extremely
+	// rare on Razorpay.
+	//
+	// The user's `currency` parameter is NOT used here for amount conversion
+	// — it's only echoed back in the response for display. The ACTUAL charge
+	// is always in the order's currency (determined by the merchant's site).
 	//
 	// Default: ₹1.00 (100 paise) — matches the historical behaviour so
 	// existing callers that don't pass `amount` keep working unchanged.
@@ -1071,7 +1084,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		currency = "INR"
 	}
 	currency = strings.ToUpper(strings.TrimSpace(currency))
-	forceAmount := float64(toSmallestUnit(amountINR, currency))
+	forceAmount := math.Round(amountINR * 100) // always ×100 (2-decimal assumption)
 	if forceAmount < 1 {
 		forceAmount = 100 // safety net — never send 0 to Razorpay
 	}
@@ -1165,17 +1178,24 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		orderAmount = 100
 	}
 
-	// `orderCurrency` is the user-supplied currency (default "INR"). We
-	// prefer it over whatever the order response returns because the
-	// merchant's payment link may be configured for a different currency
-	// than what the user explicitly requested.
+	// `orderCurrency` MUST come from the order response, NOT from the
+	// user's input. Razorpay payment links are currency-locked — when you
+	// create an order against a payment link, the order inherits the link's
+	// currency (usually INR). You CANNOT change it. If we send a different
+	// currency in the payment creation step, Razorpay rejects it with:
+	//   "Payment currency provided does not match with the currency in order"
+	//
+	// So the user's `currency` parameter only affects the amount conversion
+	// (paise vs cents) — the ACTUAL charge is always in the order's currency.
 	orderCurrency := strings.ToUpper(strings.TrimSpace(getStringFromMap(orderObj, "currency")))
-	if currency != "" {
-		orderCurrency = currency
-	}
 	if orderCurrency == "" {
 		orderCurrency = "INR"
 	}
+
+	// Update the response currency to reflect what was ACTUALLY charged.
+	// The defer at the top of checkCard captured `resolvedCurrency` by
+	// reference, so updating it here will be reflected in the response.
+	resolvedCurrency = orderCurrency
 
 	// Step 3: Get checkout session
 	params3 := url.Values{
