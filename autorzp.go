@@ -726,7 +726,13 @@ var (
 
 // getExchangeRate returns the exchange rate from `from` currency to `to` currency.
 // E.g. getExchangeRate("USD", "INR") might return 83.12 (1 USD = 83.12 INR).
-// Results are cached for 1 hour. Returns an error if the API call fails.
+// Results are cached for 1 hour. Returns an error if both APIs fail.
+//
+// Uses TWO free APIs (no key required) for maximum reliability:
+//  1. Frankfurter (ECB rates) — https://api.frankfurter.dev/v1/latest
+//     Supports ~30 major currencies but NOT AED, BHD, etc.
+//  2. ExchangeRate-API — https://api.exchangerate-api.com/v4/latest
+//     Supports ALL ~160 world currencies (fallback for AED etc.)
 func getExchangeRate(from, to string) (float64, error) {
 	from = strings.ToUpper(strings.TrimSpace(from))
 	to = strings.ToUpper(strings.TrimSpace(to))
@@ -749,46 +755,99 @@ func getExchangeRate(from, to string) (float64, error) {
 	}
 	exchangeRateCacheMutex.Unlock()
 
-	// Frankfurter API: https://api.frankfurter.app/latest?from=USD&to=INR
-	// Returns: {"amount":1.0,"base":"USD","date":"2026-07-03","rates":{"INR":83.12}}
-	apiURL := fmt.Sprintf("https://api.frankfurter.app/latest?from=%s&to=%s", from, to)
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(apiURL)
-	if err != nil {
-		return 0, fmt.Errorf("exchange rate fetch failed: %w", err)
-	}
-	defer resp.Body.Close()
 
+	// ── API 1: Frankfurter (new URL — old api.frankfurter.app redirects here) ──
+	// Returns: {"amount":1.0,"base":"USD","date":"2026-07-03","rates":{"INR":83.12}}
+	frankfurterURL := fmt.Sprintf("https://api.frankfurter.dev/v1/latest?from=%s&to=%s", from, to)
+	if resp, err := client.Get(frankfurterURL); err == nil {
+		rate, ferr := parseFrankfurterResponse(resp, to)
+		resp.Body.Close()
+		if ferr == nil && rate > 0 {
+			exchangeRateCacheMutex.Lock()
+			exchangeRateCache[cacheKey] = rate
+			exchangeRateCacheTimes[cacheKey] = time.Now()
+			exchangeRateCacheMutex.Unlock()
+			log.Printf("[exchange-rate] %s→%s = %.4f (Frankfurter)", from, to, rate)
+			return rate, nil
+		}
+		log.Printf("[exchange-rate] Frankfurter failed for %s→%s: %v — trying fallback", from, to, ferr)
+	} else {
+		log.Printf("[exchange-rate] Frankfurter request failed for %s→%s: %v — trying fallback", from, to, err)
+	}
+
+	// ── API 2: ExchangeRate-API (fallback — supports ALL currencies including AED) ──
+	// Returns: {"base":"AED","rates":{"INR":25.97,"USD":0.272,...}}
+	erAPIURL := fmt.Sprintf("https://api.exchangerate-api.com/v4/latest/%s", from)
+	if resp, err := client.Get(erAPIURL); err == nil {
+		rate, ferr := parseExchangeRateAPIResponse(resp, to)
+		resp.Body.Close()
+		if ferr == nil && rate > 0 {
+			exchangeRateCacheMutex.Lock()
+			exchangeRateCache[cacheKey] = rate
+			exchangeRateCacheTimes[cacheKey] = time.Now()
+			exchangeRateCacheMutex.Unlock()
+			log.Printf("[exchange-rate] %s→%s = %.4f (ExchangeRate-API fallback)", from, to, rate)
+			return rate, nil
+		}
+		return 0, fmt.Errorf("exchange rate fetch failed for %s→%s: Frankfurter + ExchangeRate-API both failed (fallback err: %v)", from, to, ferr)
+	}
+
+	return 0, fmt.Errorf("exchange rate fetch failed for %s→%s: both APIs unreachable", from, to)
+}
+
+// parseFrankfurterResponse parses a Frankfurter API response and extracts
+// the rate for the target currency.
+func parseFrankfurterResponse(resp *http.Response, to string) (float64, error) {
 	if resp.StatusCode != 200 {
-		return 0, fmt.Errorf("exchange rate API returned HTTP %d", resp.StatusCode)
+		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return 0, fmt.Errorf("exchange rate read failed: %w", err)
+		return 0, fmt.Errorf("read failed: %w", err)
 	}
+	var data struct {
+		Rates   map[string]float64 `json:"rates"`
+		Message string             `json:"message"` // Frankfurter returns {"message":"not found"} for unsupported currencies
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return 0, fmt.Errorf("parse failed: %w", err)
+	}
+	if data.Message != "" {
+		return 0, fmt.Errorf("API message: %s", data.Message)
+	}
+	rate, ok := data.Rates[to]
+	if !ok {
+		return 0, fmt.Errorf("rate for %s not found", to)
+	}
+	if rate <= 0 {
+		return 0, fmt.Errorf("invalid rate: %f", rate)
+	}
+	return rate, nil
+}
 
+// parseExchangeRateAPIResponse parses an exchangerate-api.com response.
+func parseExchangeRateAPIResponse(resp *http.Response, to string) (float64, error) {
+	if resp.StatusCode != 200 {
+		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return 0, fmt.Errorf("read failed: %w", err)
+	}
 	var data struct {
 		Rates map[string]float64 `json:"rates"`
 	}
 	if err := json.Unmarshal(body, &data); err != nil {
-		return 0, fmt.Errorf("exchange rate parse failed: %w", err)
+		return 0, fmt.Errorf("parse failed: %w", err)
 	}
-
 	rate, ok := data.Rates[to]
 	if !ok {
-		return 0, fmt.Errorf("exchange rate for %s→%s not found in response", from, to)
+		return 0, fmt.Errorf("rate for %s not found", to)
 	}
-
 	if rate <= 0 {
-		return 0, fmt.Errorf("invalid exchange rate: %f", rate)
+		return 0, fmt.Errorf("invalid rate: %f", rate)
 	}
-
-	exchangeRateCacheMutex.Lock()
-	exchangeRateCache[cacheKey] = rate
-	exchangeRateCacheTimes[cacheKey] = time.Now()
-	exchangeRateCacheMutex.Unlock()
-
 	return rate, nil
 }
 
