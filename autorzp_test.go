@@ -607,3 +607,294 @@ func TestIsRazorpayServerError(t *testing.T) {
 		t.Errorf("isRazorpayServerError(\"\") = true, want false")
 	}
 }
+
+// ─── parseAmountParam ──────────────────────────────────────────────────────
+// Covers the new custom-amount feature: integer rupees, decimal rupees, paise
+// suffix, defaults, and bounds.
+
+func TestParseAmountParam(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		want     float64
+		wantHave bool
+		wantErr  bool
+	}{
+		{"empty → default ₹1", "", 1.0, false, false},
+		{"whitespace → default ₹1", "   ", 1.0, false, false},
+		{"integer 5", "5", 5.0, true, false},
+		{"integer 10", "10", 10.0, true, false},
+		{"decimal 1.5", "1.5", 1.5, true, false},
+		{"decimal 0.99", "0.99", 0.99, true, false},
+		{"decimal 99.99", "99.99", 99.99, true, false},
+		{"paise 500p → 5.0", "500p", 5.0, true, false},
+		{"paise 100P → 1.0 (uppercase)", "100P", 1.0, true, false},
+		{"paise 250p → 2.5", "250p", 2.5, true, false},
+		{"paise 1p → 0.01", "1p", 0.01, true, false},
+		{"zero — below min", "0", 0, true, true},
+		{"negative — below min", "-5", 0, true, true},
+		{"0.001 — below min (0.01)", "0.001", 0, true, true},
+		{"non-numeric", "abc", 0, false, true},
+		{"mixed garbage", "5abc", 0, false, true},
+		{"scientific notation 1e2", "1e2", 100.0, true, false}, // strconv.ParseFloat accepts this
+		{"with whitespace around", "  5  ", 5.0, true, false},
+		{"paise with whitespace", "  500p  ", 5.0, true, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, have, err := parseAmountParam(c.input)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("parseAmountParam(%q) expected error, got %v (have=%v)", c.input, got, have)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseAmountParam(%q) unexpected error: %v", c.input, err)
+			}
+			if have != c.wantHave {
+				t.Errorf("parseAmountParam(%q).have = %v, want %v", c.input, have, c.wantHave)
+			}
+			if got != c.want {
+				t.Errorf("parseAmountParam(%q) = %v, want %v", c.input, got, c.want)
+			}
+		})
+	}
+}
+
+// parseAmountParam's upper bound is configurable via MAX_AMOUNT env var. We
+// verify the default cap rejects 100000.01 and accepts exactly 100000, then
+// raise the cap and verify a value that was previously rejected is now OK.
+
+func TestParseAmountParamMaxBound(t *testing.T) {
+	// Default cap = 100000
+	if _, _, err := parseAmountParam("100000.01"); err == nil {
+		t.Errorf("amount 100000.01 should be rejected by default cap")
+	}
+	if v, _, err := parseAmountParam("100000"); err != nil {
+		t.Errorf("amount 100000 should be accepted by default cap, got err: %v", err)
+	} else if v != 100000.0 {
+		t.Errorf("amount 100000 = %v, want 100000", v)
+	}
+
+	// Raise the cap via env var
+	t.Setenv("MAX_AMOUNT", "500000")
+	if v, _, err := parseAmountParam("250000"); err != nil {
+		t.Errorf("amount 250000 should be accepted after raising MAX_AMOUNT, got err: %v", err)
+	} else if v != 250000.0 {
+		t.Errorf("amount 250000 = %v, want 250000", v)
+	}
+
+	// Lower the cap via env var
+	t.Setenv("MAX_AMOUNT", "10")
+	if _, _, err := parseAmountParam("50"); err == nil {
+		t.Errorf("amount 50 should be rejected after lowering MAX_AMOUNT to 10")
+	}
+	if v, _, err := parseAmountParam("10"); err != nil {
+		t.Errorf("amount 10 should be accepted when MAX_AMOUNT=10, got err: %v", err)
+	} else if v != 10.0 {
+		t.Errorf("amount 10 = %v, want 10", v)
+	}
+}
+
+// ─── parseCurrencyParam ────────────────────────────────────────────────────
+
+func TestParseCurrencyParam(t *testing.T) {
+	cases := []struct {
+		name     string
+		input    string
+		want     string
+		wantHave bool
+		wantErr  bool
+	}{
+		{"empty → default INR", "", "INR", false, false},
+		{"whitespace → default INR", "  ", "INR", false, false},
+		{"lowercase inr", "inr", "INR", true, false},
+		{"uppercase INR", "INR", "INR", true, false},
+		{"Mixed Case Usd", "Usd", "USD", true, false},
+		{"USD", "USD", "USD", true, false},
+		{"EUR", "EUR", "EUR", true, false},
+		{"JPY", "JPY", "JPY", true, false},
+		{"with whitespace", "  usd  ", "USD", true, false},
+		{"2-letter too short", "US", "", true, true},
+		{"4-letter too long", "USDD", "", true, true},
+		{"digits in code", "US1", "", true, true},
+		{"symbols in code", "U$D", "", true, true},
+		{"empty after strip", "  ", "INR", false, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, have, err := parseCurrencyParam(c.input)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("parseCurrencyParam(%q) expected error, got %q (have=%v)", c.input, got, have)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseCurrencyParam(%q) unexpected error: %v", c.input, err)
+			}
+			if have != c.wantHave {
+				t.Errorf("parseCurrencyParam(%q).have = %v, want %v", c.input, have, c.wantHave)
+			}
+			if got != c.want {
+				t.Errorf("parseCurrencyParam(%q) = %q, want %q", c.input, got, c.want)
+			}
+		})
+	}
+}
+
+// ─── extractPathParams ─────────────────────────────────────────────────────
+// Verifies the path-style `cc=...|...|...|...&amount=N&currency=CCC` parser
+// correctly separates card data from extra params.
+
+func TestExtractPathParams(t *testing.T) {
+	cases := []struct {
+		name       string
+		input      string
+		wantCard   string
+		wantParams map[string]string
+	}{
+		{
+			name:       "no params, just card",
+			input:      "4111111111111111|12|25|123",
+			wantCard:   "4111111111111111|12|25|123",
+			wantParams: map[string]string{},
+		},
+		{
+			name:       "amount only",
+			input:      "4111111111111111|12|25|123&amount=5",
+			wantCard:   "4111111111111111|12|25|123",
+			wantParams: map[string]string{"amount": "5"},
+		},
+		{
+			name:       "amount + currency",
+			input:      "4111111111111111|12|25|123&amount=5&currency=USD",
+			wantCard:   "4111111111111111|12|25|123",
+			wantParams: map[string]string{"amount": "5", "currency": "USD"},
+		},
+		{
+			name:       "currency only",
+			input:      "4111111111111111|12|25|123&currency=INR",
+			wantCard:   "4111111111111111|12|25|123",
+			wantParams: map[string]string{"currency": "INR"},
+		},
+		{
+			name:       "paise amount",
+			input:      "4111111111111111|12|25|123&amount=500p",
+			wantCard:   "4111111111111111|12|25|123",
+			wantParams: map[string]string{"amount": "500p"},
+		},
+		{
+			name:       "extra unknown params ignored gracefully",
+			input:      "4111111111111111|12|25|123&amount=5&foo=bar&currency=USD",
+			wantCard:   "4111111111111111|12|25|123",
+			wantParams: map[string]string{"amount": "5", "foo": "bar", "currency": "USD"},
+		},
+		{
+			name:       "key with no value",
+			input:      "4111111111111111|12|25|123&amount",
+			wantCard:   "4111111111111111|12|25|123",
+			wantParams: map[string]string{},
+		},
+		{
+			name:       "trailing & with no content",
+			input:      "4111111111111111|12|25|123&",
+			wantCard:   "4111111111111111|12|25|123",
+			wantParams: map[string]string{},
+		},
+		{
+			name:       "case-insensitive keys (uppercase)",
+			input:      "4111111111111111|12|25|123&AMOUNT=5&CURRENCY=USD",
+			wantCard:   "4111111111111111|12|25|123",
+			wantParams: map[string]string{"amount": "5", "currency": "USD"},
+		},
+		{
+			name:       "mixed case keys",
+			input:      "4111111111111111|12|25|123&Amount=5&Currency=USD",
+			wantCard:   "4111111111111111|12|25|123",
+			wantParams: map[string]string{"amount": "5", "currency": "USD"},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			gotCard, gotParams := extractPathParams(c.input)
+			if gotCard != c.wantCard {
+				t.Errorf("card = %q, want %q", gotCard, c.wantCard)
+			}
+			if len(gotParams) != len(c.wantParams) {
+				t.Fatalf("params count = %d, want %d (got=%v want=%v)",
+					len(gotParams), len(c.wantParams), gotParams, c.wantParams)
+			}
+			for k, v := range c.wantParams {
+				if gotParams[k] != v {
+					t.Errorf("params[%q] = %q, want %q", k, gotParams[k], v)
+				}
+			}
+		})
+	}
+}
+
+// ─── toSmallestUnit ────────────────────────────────────────────────────────
+// Verifies the major-unit → smallest-unit conversion used by checkCard.
+
+func TestToSmallestUnit(t *testing.T) {
+	cases := []struct {
+		name     string
+		amount   float64
+		currency string
+		want     int64
+	}{
+		// 2-decimal currencies (×100)
+		{"₹1 INR", 1.0, "INR", 100},
+		{"₹5 INR", 5.0, "INR", 500},
+		{"₹1.50 INR", 1.50, "INR", 150},
+		{"₹0.99 INR", 0.99, "INR", 99},
+		{"₹0.01 INR (1 paise)", 0.01, "INR", 1},
+		{"$1 USD", 1.0, "USD", 100},
+		{"$2.50 USD", 2.50, "USD", 250},
+		{"€10 EUR", 10.0, "EUR", 1000},
+		{"£0.99 GBP", 0.99, "GBP", 99},
+		// case-insensitive currency
+		{"lowercase usd", 1.0, "usd", 100},
+		{"mixed case Inr", 1.0, "Inr", 100},
+		// 0-decimal currencies (×1)
+		{"¥1 JPY", 1.0, "JPY", 1},
+		{"¥100 JPY", 100.0, "JPY", 100},
+		{"¥1.50 JPY (rounds to 2)", 1.50, "JPY", 2}, // math.Round(1.5) = 2
+		{"₩1000 KRW", 1000.0, "KRW", 1000},
+		{"₫5000 VND", 5000.0, "VND", 5000},
+		// Floating-point drift protection
+		// 1.15 * 100 = 114.99999... in float64, must round to 115
+		{"1.15 INR drift fix", 1.15, "INR", 115},
+		// 0 amount
+		{"0 INR", 0.0, "INR", 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := toSmallestUnit(c.amount, c.currency)
+			if got != c.want {
+				t.Errorf("toSmallestUnit(%v, %q) = %d, want %d", c.amount, c.currency, got, c.want)
+			}
+		})
+	}
+}
+
+// ─── zeroDecimalCurrencies ─────────────────────────────────────────────────
+// Sanity-check that the zero-decimal currency map contains the currencies we
+// document in the comment, and does NOT contain INR/USD/EUR.
+
+func TestZeroDecimalCurrencies(t *testing.T) {
+	shouldBeZero := []string{"JPY", "KRW", "VND", "CLP", "ISK", "PYG", "UGX", "RWF", "BIF", "DJF", "GNF", "KMF", "XAF", "XOF", "XPF"}
+	for _, c := range shouldBeZero {
+		if !zeroDecimalCurrencies[c] {
+			t.Errorf("zeroDecimalCurrencies[%q] = false, want true", c)
+		}
+	}
+	shouldNotBeZero := []string{"INR", "USD", "EUR", "GBP", "AUD", "CAD", "CNY", "AED", "SGD"}
+	for _, c := range shouldNotBeZero {
+		if zeroDecimalCurrencies[c] {
+			t.Errorf("zeroDecimalCurrencies[%q] = true, want false", c)
+		}
+	}
+}

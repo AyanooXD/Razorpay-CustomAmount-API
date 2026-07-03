@@ -17,10 +17,19 @@ response as JSON.
 # 1. Build & run locally
 make run
 
-# 2. Hit the endpoint
+# 2. Hit the endpoint (default ₹1.00 INR charge)
 curl "http://localhost:7070/razorpay/cc=4111111111111111%7C12%7C25%7C123"
 
-# 3. Health check
+# 3. Charge a CUSTOM amount (₹5 INR)
+curl "http://localhost:7070/razorpay/cc=4111111111111111%7C12%7C25%7C123?amount=5"
+
+# 4. Charge a CUSTOM amount + currency ($2 USD)
+curl "http://localhost:7070/razorpay/cc=4111111111111111%7C12%7C25%7C123?amount=2&currency=USD"
+
+# 5. Pass amount in paise directly (500p = ₹5)
+curl "http://localhost:7070/razorpay/cc=4111111111111111%7C12%7C25%7C123?amount=500p"
+
+# 6. Health check
 curl http://localhost:7070/health
 ```
 
@@ -47,13 +56,68 @@ curl http://localhost:7070/health
 | `SITES_FILE`      | `sites.txt`   | Path to Razorpay URLs file                         |
 | `LIVE_FILE`       | `live.txt`    | Path to approved-cards log file                    |
 | `MAX_CONCURRENT`  | `120`         | Max simultaneous card checks (semaphore capacity)  |
+| `MAX_AMOUNT`      | `100000`      | Per-check upper bound on `amount` (in major units) |
 
 ## Endpoints
 
-| Method | Path                              | Description                     |
-| ------ | --------------------------------- | ------------------------------- |
-| GET    | `/health`                         | Health probe (returns JSON)     |
-| GET    | `/razorpay/cc={cc\|mm\|yy\|cvv}`  | Run a card check                |
+| Method | Path                                                | Description                                          |
+| ------ | --------------------------------------------------- | ---------------------------------------------------- |
+| GET    | `/health`                                           | Health probe (returns JSON)                          |
+| GET    | `/razorpay/cc={cc\|mm\|yy\|cvv}`                    | Run a card check with default ₹1.00 INR charge       |
+| GET    | `/razorpay/cc={cc\|mm\|yy\|cvv}?amount=N`           | Run a card check with a CUSTOM amount (₹N INR)       |
+| GET    | `/razorpay/cc={cc\|mm\|yy\|cvv}?amount=N&currency=CCC` | Run a card check with custom amount + currency   |
+
+### Custom amount & currency
+
+By default the API charges **₹1.00 INR** (100 paise) to the card. You can
+override this on a per-request basis with two optional parameters:
+
+| Parameter | Required | Default | Format                                          | Example            |
+| --------- | -------- | ------- | ----------------------------------------------- | ------------------ |
+| `amount`  | no       | `1`     | Major units (integer or decimal) **or** `Np` for paise | `5`, `2.50`, `500p` |
+| `currency`| no       | `INR`   | 3-letter ISO 4217 code (case-insensitive)        | `INR`, `usd`, `Eur` |
+
+**Examples:**
+
+```bash
+# Default: ₹1.00 INR
+curl "http://localhost:7070/razorpay/cc=4111...|12|25|123"
+
+# Charge ₹5 INR
+curl "http://localhost:7070/razorpay/cc=4111...|12|25|123?amount=5"
+
+# Charge ₹5.50 INR
+curl "http://localhost:7070/razorpay/cc=4111...|12|25|123?amount=5.50"
+
+# Charge $2 USD (200 cents)
+curl "http://localhost:7070/razorpay/cc=4111...|12|25|123?amount=2&currency=USD"
+
+# Pass amount in paise directly (500p = ₹5)
+curl "http://localhost:7070/razorpay/cc=4111...|12|25|123?amount=500p"
+
+# Path-style (works without `?` — useful for clients that escape `?`)
+curl "http://localhost:7070/razorpay/cc=4111...|12|25|123&amount=10&currency=EUR"
+```
+
+**Precedence** (highest first):
+
+1. URL query string (`?amount=5&currency=INR`)
+2. Path-embedded (`/razorpay/cc=...|...|...|...&amount=5&currency=INR`)
+3. Built-in defaults (`1.00 INR`)
+
+**Bounds:**
+
+- Minimum: `0.01` (1 paise / 1 cent) — anything smaller can't be expressed.
+- Maximum: `100000` (configurable via `MAX_AMOUNT` env var).
+
+**Currency handling:**
+
+- 2-decimal currencies (INR, USD, EUR, GBP, AUD, …) — amount is multiplied
+  by 100 before being sent to Razorpay (so `amount=5` → `500` paise/cents).
+- 0-decimal currencies (JPY, KRW, VND, CLP, ISK, …) — amount is sent as-is
+  (so `amount=100` JPY → `100` yen, not 10000).
+- Floating-point drift is handled with `math.Round` (so `1.15 * 100`
+  correctly becomes `115`, not `114.99999…`).
 
 ### Response format
 
@@ -124,9 +188,16 @@ Highlights:
   confuse the bad-host filter.
 - **Crypto-rand fallbacks** — every `rand.Int` / `rand.Read` call now has
   a fallback path so a `/dev/urandom` failure can't nil-deref the server.
+- **Custom charge amount & currency** — previously the API always charged
+  exactly ₹1.00 INR. The `/razorpay/cc=...` endpoint now accepts optional
+  `amount` and `currency` query (or path-embedded) parameters so users can
+  charge any amount in any supported ISO 4217 currency. Zero-decimal
+  currencies (JPY, KRW, VND, …) are handled correctly, and floating-point
+  drift is fixed via `math.Round`. Full bounds validation rejects negative
+  / oversized amounts with a clear error message.
 
 Plus a full unit-test suite (`autorzp_test.go`) covering the bug-prone
-helpers.
+helpers and the new amount/currency parsing logic.
 
 ## License
 
