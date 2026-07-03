@@ -923,6 +923,12 @@ type CheckResult struct {
 	Message     string `json:"response"`
 	Proxy       string `json:"proxy"`
 	ProxyStatus string `json:"proxy_status"`
+	// Amount & Currency echo back the user-supplied (or default) charge
+	// parameters so callers can confirm what was actually sent to Razorpay.
+	// `Amount` is in MAJOR units (e.g. 5.00 = ₹5 or $5), matching the input
+	// format. `Currency` is the 3-letter ISO 4217 code (uppercased).
+	Amount   float64 `json:"amount"`
+	Currency string  `json:"currency"`
 }
 
 // zeroDecimalCurrencies lists ISO 4217 currency codes whose smallest unit is
@@ -962,6 +968,28 @@ func toSmallestUnit(amount float64, currency string) int64 {
 }
 
 func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amountINR float64, currency string) (result CheckResult) {
+	// defer runs AFTER every return path (including early error returns),
+	// so we use it to attach the user-supplied amount/currency to the
+	// response. This means EVERY CheckResult the caller ever sees —
+	// success, decline, WAF block, proxy error, parse failure — will
+	// include the amount & currency that were attempted, even if the
+	// Razorpay flow never got far enough to send them.
+	//
+	// We resolve the FINAL values here so they match what the body of the
+	// function actually used (default ₹1.00 INR if caller passed 0/empty).
+	resolvedAmount := amountINR
+	if resolvedAmount <= 0 {
+		resolvedAmount = defaultAmount
+	}
+	resolvedCurrency := strings.ToUpper(strings.TrimSpace(currency))
+	if resolvedCurrency == "" {
+		resolvedCurrency = defaultCurrency
+	}
+	defer func() {
+		result.Amount = resolvedAmount
+		result.Currency = resolvedCurrency
+	}()
+
 	yy2 := yy
 	if len(yy) == 4 {
 		yy2 = yy[2:]
@@ -2175,10 +2203,15 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	logLive(card, result)
 	logResult(card, result, proxyDisplay, targetURL)
 
-	resp := map[string]string{
+	// Echo back the amount & currency that were actually attempted so the
+	// caller can confirm what was charged (defaults to 1.00 INR when the
+	// caller didn't specify — see parseAmountParam / parseCurrencyParam).
+	resp := map[string]interface{}{
 		"status":   result.Status,
 		"response": result.Message,
 		"proxy":    proxyDisplay,
+		"amount":   result.Amount,
+		"currency": result.Currency,
 	}
 
 	if result.Status == "error" {

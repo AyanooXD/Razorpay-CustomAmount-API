@@ -125,9 +125,16 @@ curl "http://localhost:7070/razorpay/cc=4111...|12|25|123&amount=10&currency=EUR
 {
   "status":   "approved|declined|charged|error",
   "response": "Insufficient funds (insufficient_funds)",
-  "proxy":    "http://1.2.3.4:8080 [LIVE]"
+  "proxy":    "http://1.2.3.4:8080 [LIVE]",
+  "amount":   5,
+  "currency": "INR"
 }
 ```
+
+The `amount` and `currency` fields echo back the values that were actually
+attempted on the card (in major units — `5` = ₹5, not 500 paise). They are
+present on EVERY response, including errors and WAF blocks, so you can always
+confirm what was charged.
 
 ## Development
 

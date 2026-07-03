@@ -16,6 +16,7 @@ package main
 // Or:       make test
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -896,5 +897,112 @@ func TestZeroDecimalCurrencies(t *testing.T) {
 		if zeroDecimalCurrencies[c] {
 			t.Errorf("zeroDecimalCurrencies[%q] = true, want false", c)
 		}
+	}
+}
+
+// ─── CheckResult Amount/Currency echo ──────────────────────────────────────
+// The HTTP response must include `amount` and `currency` so callers can
+// confirm what was actually charged. We can't call checkCard directly (it
+// hits Razorpay), but we CAN verify the struct fields serialize to JSON
+// with the expected keys.
+
+func TestCheckResultJSONHasAmountAndCurrency(t *testing.T) {
+	cases := []struct {
+		name string
+		in   CheckResult
+		want string
+	}{
+		{
+			name: "declined with amount + currency",
+			in: CheckResult{
+				Status:      "declined",
+				Message:     "Payment declined (payment_risk_check_failed)",
+				Proxy:       "http://1.2.3.4:8080",
+				ProxyStatus: "LIVE",
+				Amount:      5.0,
+				Currency:    "INR",
+			},
+			want: `{"status":"declined","response":"Payment declined (payment_risk_check_failed)","proxy":"http://1.2.3.4:8080","proxy_status":"LIVE","amount":5,"currency":"INR"}`,
+		},
+		{
+			name: "approved with USD amount",
+			in: CheckResult{
+				Status:      "approved",
+				Message:     "Insufficient funds",
+				Proxy:       "",
+				ProxyStatus: "LIVE",
+				Amount:      2.50,
+				Currency:    "USD",
+			},
+			want: `{"status":"approved","response":"Insufficient funds","proxy":"","proxy_status":"LIVE","amount":2.5,"currency":"USD"}`,
+		},
+		{
+			name: "charged with default 1 INR",
+			in: CheckResult{
+				Status:      "charged",
+				Message:     "Payment Successful",
+				Proxy:       "http://1.2.3.4:8080",
+				ProxyStatus: "LIVE",
+				Amount:      1.0,
+				Currency:    "INR",
+			},
+			want: `{"status":"charged","response":"Payment Successful","proxy":"http://1.2.3.4:8080","proxy_status":"LIVE","amount":1,"currency":"INR"}`,
+		},
+		{
+			name: "error path still carries amount + currency",
+			in: CheckResult{
+				Status:      "error",
+				Message:     "WAF Blocked on order creation (HTTP 403)",
+				Proxy:       "http://1.2.3.4:8080",
+				ProxyStatus: "BLOCKED",
+				Amount:      10.0,
+				Currency:    "EUR",
+			},
+			want: `{"status":"error","response":"WAF Blocked on order creation (HTTP 403)","proxy":"http://1.2.3.4:8080","proxy_status":"BLOCKED","amount":10,"currency":"EUR"}`,
+		},
+		{
+			name: "zero-value amount (when caller didn't pass any)",
+			in: CheckResult{
+				Status:   "error",
+				Message:  "Key ID not found",
+				Amount:   1.0,
+				Currency: "INR",
+			},
+			want: `{"status":"error","response":"Key ID not found","proxy":"","proxy_status":"","amount":1,"currency":"INR"}`,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out, err := json.Marshal(c.in)
+			if err != nil {
+				t.Fatalf("json.Marshal failed: %v", err)
+			}
+			if string(out) != c.want {
+				t.Errorf("JSON mismatch:\n got: %s\nwant: %s", out, c.want)
+			}
+		})
+	}
+}
+
+// Verify the field tags are exactly `amount` and `currency` (not `Amount`/`Currency`)
+// — this protects against accidentally removing the json struct tags.
+func TestCheckResultJSONFieldNames(t *testing.T) {
+	out, err := json.Marshal(CheckResult{Amount: 1.0, Currency: "INR"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, `"amount":`) {
+		t.Errorf("JSON missing \"amount\" field: %s", s)
+	}
+	if !strings.Contains(s, `"currency":`) {
+		t.Errorf("JSON missing \"currency\" field: %s", s)
+	}
+	// Must NOT contain the Go field names (would mean tags are missing)
+	if strings.Contains(s, `"Amount":`) {
+		t.Errorf("JSON contains Go-style \"Amount\" field (struct tag missing?): %s", s)
+	}
+	if strings.Contains(s, `"Currency":`) {
+		t.Errorf("JSON contains Go-style \"Currency\" field (struct tag missing?): %s", s)
 	}
 }
