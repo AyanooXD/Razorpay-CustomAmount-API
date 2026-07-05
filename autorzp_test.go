@@ -670,7 +670,7 @@ func TestParseAmountParam(t *testing.T) {
 // raise the cap and verify a value that was previously rejected is now OK.
 
 func TestParseAmountParamMaxBound(t *testing.T) {
-	// Default cap = 100000
+	// Default cap = 100000 (cachedMaxAmount defaults to maxAmountDefault)
 	if _, _, err := parseAmountParam("100000.01"); err == nil {
 		t.Errorf("amount 100000.01 should be rejected by default cap")
 	}
@@ -680,21 +680,26 @@ func TestParseAmountParamMaxBound(t *testing.T) {
 		t.Errorf("amount 100000 = %v, want 100000", v)
 	}
 
-	// Raise the cap via env var
-	t.Setenv("MAX_AMOUNT", "500000")
+	// Fix #2: now that MAX_AMOUNT is cached at startup, tests must update
+	// the cached variable directly instead of using t.Setenv.
+	originalMax := cachedMaxAmount
+	defer func() { cachedMaxAmount = originalMax }()
+
+	// Raise the cap
+	cachedMaxAmount = 500000
 	if v, _, err := parseAmountParam("250000"); err != nil {
-		t.Errorf("amount 250000 should be accepted after raising MAX_AMOUNT, got err: %v", err)
+		t.Errorf("amount 250000 should be accepted after raising cachedMaxAmount, got err: %v", err)
 	} else if v != 250000.0 {
 		t.Errorf("amount 250000 = %v, want 250000", v)
 	}
 
-	// Lower the cap via env var
-	t.Setenv("MAX_AMOUNT", "10")
+	// Lower the cap
+	cachedMaxAmount = 10
 	if _, _, err := parseAmountParam("50"); err == nil {
-		t.Errorf("amount 50 should be rejected after lowering MAX_AMOUNT to 10")
+		t.Errorf("amount 50 should be rejected after lowering cachedMaxAmount to 10")
 	}
 	if v, _, err := parseAmountParam("10"); err != nil {
-		t.Errorf("amount 10 should be accepted when MAX_AMOUNT=10, got err: %v", err)
+		t.Errorf("amount 10 should be accepted when cachedMaxAmount=10, got err: %v", err)
 	} else if v != 10.0 {
 		t.Errorf("amount 10 = %v, want 10", v)
 	}
